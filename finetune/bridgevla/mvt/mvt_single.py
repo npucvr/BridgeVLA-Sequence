@@ -16,6 +16,7 @@ Therefore, the code is also under the NVIDIA Source Code License
 Author: Peiyan Li
 Email: peiyan.li@cripac.ia.ac.cn
 '''
+import os
 import torch
 from torch import nn
 from einops import rearrange
@@ -214,7 +215,7 @@ class MVT(nn.Module):
             return all_params
 
 
-        model_id = "google/paligemma-3b-pt-224"
+        model_id = os.environ.get("PALIGEMMA_PATH", "google/paligemma-3b-pt-224")
         if load_pretrain:
             assert pretrain_path is not None
 

@@ -232,7 +232,7 @@ def eval(
                     timesteps=1,
                     eval=True,
                     eval_demo_seed=ep,
-                    record_enabled=False,
+                    record_enabled=save_video,
                     replay_ground_truth=replay_ground_truth,
                 )
             else:
@@ -459,7 +459,8 @@ if __name__ == "__main__":
     if args.log_name is None:
         args.log_name = "none"
 
-    args.eval_log_dir = os.path.join(args.model_folder, "eval", args.log_name)
+    log_base = args.log_dir if args.log_dir else args.model_folder
+    args.eval_log_dir = os.path.join(log_base, "eval", args.log_name)
 
     os.makedirs(args.eval_log_dir, exist_ok=True)
 

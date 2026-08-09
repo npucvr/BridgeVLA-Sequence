@@ -150,6 +150,7 @@ def get_eval_parser():
     parser.add_argument("--exp_cfg_path", type=str, default=None)
     parser.add_argument("--mvt_cfg_path", type=str, default=None)
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--log-dir", type=str, default=None)
     parser.add_argument("--log-name", type=str, default="test/1")
     parser.add_argument("--model-name", type=str, default="model_80.pth")
     parser.add_argument("--use-input-place-with-mean", action="store_true")

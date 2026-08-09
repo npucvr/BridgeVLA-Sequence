@@ -94,12 +94,12 @@ class CustomRLBenchEnv(RLBenchEnv):
         super(CustomRLBenchEnv, self).launch()
         self._task._scene.register_step_callback(self._my_callback)
         if self.eval:
-            cam_placeholder = Dummy('cam_cinematic_placeholder')
             cam_base = Dummy('cam_cinematic_base')
             cam_base.rotate([0, 0, np.pi * 0.75])
             self._record_cam = VisionSensor.create([320, 180])
             self._record_cam.set_explicit_handling(True)
-            self._record_cam.set_pose(cam_placeholder.get_pose())
+            front_cam = VisionSensor('cam_front')
+            self._record_cam.set_pose(front_cam.get_pose())
             self._record_cam.set_render_mode(RenderMode.OPENGL)
 
     def reset(self) -> dict:
@@ -276,12 +276,12 @@ class CustomMultiTaskRLBenchEnv(MultiTaskRLBenchEnv):
         super(CustomMultiTaskRLBenchEnv, self).launch()
         self._task._scene.register_step_callback(self._my_callback)
         if self.eval:
-            cam_placeholder = Dummy('cam_cinematic_placeholder')
             cam_base = Dummy('cam_cinematic_base')
             cam_base.rotate([0, 0, np.pi * 0.75])
             self._record_cam = VisionSensor.create([320, 180])
             self._record_cam.set_explicit_handling(True)
-            self._record_cam.set_pose(cam_placeholder.get_pose())
+            front_cam = VisionSensor('cam_front')
+            self._record_cam.set_pose(front_cam.get_pose())
             self._record_cam.set_render_mode(RenderMode.OPENGL)
 
     def reset(self) -> dict:
