@@ -1,0 +1,26 @@
+Metadata-Version: 2.2
+Name: bridgevla
+Version: 0.0.1
+Author: Peiyan Li
+Author-email: peiyan.li@cripac.ia.ac.cn
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: einops
+Requires-Dist: pyrender
+Requires-Dist: transformers
+Requires-Dist: omegaconf
+Requires-Dist: natsort
+Requires-Dist: cffi
+Requires-Dist: pandas
+Requires-Dist: tensorflow
+Requires-Dist: pyquaternion
+Requires-Dist: matplotlib
+Requires-Dist: bitsandbytes
+Requires-Dist: transforms3d
+Requires-Dist: clip @ git+https://github.com/openai/CLIP.git
+Provides-Extra: xformers
+Requires-Dist: xformers @ git+https://github.com/facebookresearch/xformers.git@main#egg=xformers ; extra == "xformers"
+Dynamic: author
+Dynamic: author-email
+Dynamic: provides-extra
+Dynamic: requires-dist

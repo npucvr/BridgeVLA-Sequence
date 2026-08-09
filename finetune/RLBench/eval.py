@@ -308,7 +308,7 @@ def eval(
                 s.value for s in summaries if f"eval_envs/return/{task_name}" in s.name
             ][0]
         else:
-            task_score = "unknown"
+            task_score = float(np.mean(task_rewards))
 
         print(f"[Evaluation] Finished {task_name} | Final Score: {task_score}\n")
 

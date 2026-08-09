@@ -1,0 +1,8 @@
+setup.py
+bridgevla/__init__.py
+bridgevla/config.py
+bridgevla.egg-info/PKG-INFO
+bridgevla.egg-info/SOURCES.txt
+bridgevla.egg-info/dependency_links.txt
+bridgevla.egg-info/requires.txt
+bridgevla.egg-info/top_level.txt
