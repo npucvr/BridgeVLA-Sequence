@@ -1,0 +1,28 @@
+shape: sequence_diagram
+
+replay: "Replay Sampler"
+agent: "BridgeVLA Agent"
+mvt: "Two-stage MVT"
+vlm: "PaliGemma"
+heads: "Action Heads"
+optim: "Optimizer"
+
+replay -> agent: "随机单步 batch，timesteps = 1"
+agent -> agent: "预处理点云并执行 SE(3) augmentation"
+agent -> mvt: "RGB、点云、语言和训练用 GT waypoint"
+
+stage_one: "Stage 1" {
+  mvt -> vlm: "三个全局视图 + language"
+  vlm -> heads: "image tokens"
+  heads -> mvt: "粗粒度 translation heatmaps"
+}
+
+mvt -> mvt: "以带扰动的 GT waypoint 重定位场景"
+
+stage_two: "Stage 2" {
+  mvt -> vlm: "三个局部视图 + language"
+  vlm -> heads: "image tokens"
+}
+
+heads -> agent: "translation、rotation、gripper、collision logits"
+agent -> optim: "cross-entropy losses；backward() + step()"

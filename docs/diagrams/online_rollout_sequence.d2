@@ -1,0 +1,21 @@
+shape: sequence_diagram
+
+rollout: "eval.py / RolloutGenerator"
+agent: "BridgeVLA"
+env: "RLBench Env"
+controller: "Planner / Robot"
+
+rollout -> agent: "加载 checkpoint，切换 eval mode"
+rollout -> env: "reset_to_demo(seed)"
+env -> rollout: "初始观测 + language"
+
+episode: "循环：最多 25 次高层决策" {
+  rollout -> agent: "act(current_observation, language)"
+  agent -> rollout: "9D pose + gripper + collision"
+  rollout -> env: "step(action)，同步阻塞"
+  env -> controller: "裁剪 workspace、规划路径并执行夹爪"
+  controller -> env: "动作完成"
+  env -> rollout: "新观测、reward、terminal"
+}
+
+rollout -> rollout: "汇总 episode return / success rate"
