@@ -1,0 +1,29 @@
+# ===== Python build artifacts =====
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# ===== Local env bootstrap (machine-specific paths) =====
+env.sh
+
+# ===== Data & weights (user-provided, huge) =====
+data/
+data/*/
+
+# ===== Simulator binaries & vendored clones =====
+finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04/
+finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
+finetune/bridgevla/libs/PyRep/
+finetune/bridgevla/libs/RLBench/
+
+# ===== Training outputs / logs =====
+finetune/RLBench/train/
+finetune/RLBench/wandb/
+finetune/Colosseum/train/
+finetune/Colosseum/wandb/
+finetune/GemBench/train/
+finetune/GemBench/wandb/
+*.log
+.cache/
