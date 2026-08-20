@@ -1,28 +1,28 @@
 shape: sequence_diagram
 
-replay: "Replay Sampler"
-agent: "BridgeVLA Agent"
-mvt: "Two-stage MVT"
+replay: "回放采样器"
+agent: "BridgeVLA 智能体"
+mvt: "两阶段 MVT"
 vlm: "PaliGemma"
-heads: "Action Heads"
-optim: "Optimizer"
+heads: "动作预测头"
+optim: "优化器"
 
-replay -> agent: "随机单步 batch，timesteps = 1"
-agent -> agent: "预处理点云并执行 SE(3) augmentation"
-agent -> mvt: "RGB、点云、语言和训练用 GT waypoint"
+replay -> agent: "随机单步批次，timesteps = 1"
+agent -> agent: "预处理点云并执行 SE(3) 数据增强"
+agent -> mvt: "RGB、点云、任务语言和训练用真实路点"
 
-stage_one: "Stage 1" {
-  mvt -> vlm: "三个全局视图 + language"
-  vlm -> heads: "image tokens"
-  heads -> mvt: "粗粒度 translation heatmaps"
+stage_one: "阶段 1" {
+  mvt -> vlm: "三个全局视图 + 任务语言"
+  vlm -> heads: "图像 token"
+  heads -> mvt: "粗粒度平移热图"
 }
 
-mvt -> mvt: "以带扰动的 GT waypoint 重定位场景"
+mvt -> mvt: "以带扰动的真实路点重定位场景"
 
-stage_two: "Stage 2" {
-  mvt -> vlm: "三个局部视图 + language"
-  vlm -> heads: "image tokens"
+stage_two: "阶段 2" {
+  mvt -> vlm: "三个局部视图 + 任务语言"
+  vlm -> heads: "图像 token"
 }
 
-heads -> agent: "translation、rotation、gripper、collision logits"
-agent -> optim: "cross-entropy losses；backward() + step()"
+heads -> agent: "平移、旋转、夹爪和碰撞的未归一化分数"
+agent -> optim: "交叉熵损失；backward() + step()"
