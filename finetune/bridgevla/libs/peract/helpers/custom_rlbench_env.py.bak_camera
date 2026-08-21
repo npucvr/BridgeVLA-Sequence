@@ -1,5 +1,4 @@
 from typing import Type, List
-import os
 
 import numpy as np
 from rlbench import ObservationConfig, ActionMode
@@ -97,25 +96,8 @@ class CustomRLBenchEnv(RLBenchEnv):
         if self.eval:
             cam_placeholder = Dummy('cam_cinematic_placeholder')
             cam_base = Dummy('cam_cinematic_base')
-            # Cinematic recording camera.
-            # 135 deg is the original BridgeVLA view.
-            # 315 deg is approximately the opposite/front view.
-            record_cam_yaw_deg = float(
-                os.environ.get("BRIDGEVLA_RECORD_CAM_YAW_DEG", "135")
-            )
-            record_cam_width = int(
-                os.environ.get("BRIDGEVLA_RECORD_CAM_WIDTH", "640")
-            )
-            record_cam_height = int(
-                os.environ.get("BRIDGEVLA_RECORD_CAM_HEIGHT", "360")
-            )
-
-            cam_base.rotate(
-                [0, 0, np.deg2rad(record_cam_yaw_deg)]
-            )
-            self._record_cam = VisionSensor.create(
-                [record_cam_width, record_cam_height]
-            )
+            cam_base.rotate([0, 0, np.pi * 0.75])
+            self._record_cam = VisionSensor.create([320, 180])
             self._record_cam.set_explicit_handling(True)
             self._record_cam.set_pose(cam_placeholder.get_pose())
             self._record_cam.set_render_mode(RenderMode.OPENGL)
@@ -296,25 +278,8 @@ class CustomMultiTaskRLBenchEnv(MultiTaskRLBenchEnv):
         if self.eval:
             cam_placeholder = Dummy('cam_cinematic_placeholder')
             cam_base = Dummy('cam_cinematic_base')
-            # Cinematic recording camera.
-            # 135 deg is the original BridgeVLA view.
-            # 315 deg is approximately the opposite/front view.
-            record_cam_yaw_deg = float(
-                os.environ.get("BRIDGEVLA_RECORD_CAM_YAW_DEG", "135")
-            )
-            record_cam_width = int(
-                os.environ.get("BRIDGEVLA_RECORD_CAM_WIDTH", "640")
-            )
-            record_cam_height = int(
-                os.environ.get("BRIDGEVLA_RECORD_CAM_HEIGHT", "360")
-            )
-
-            cam_base.rotate(
-                [0, 0, np.deg2rad(record_cam_yaw_deg)]
-            )
-            self._record_cam = VisionSensor.create(
-                [record_cam_width, record_cam_height]
-            )
+            cam_base.rotate([0, 0, np.pi * 0.75])
+            self._record_cam = VisionSensor.create([320, 180])
             self._record_cam.set_explicit_handling(True)
             self._record_cam.set_pose(cam_placeholder.get_pose())
             self._record_cam.set_render_mode(RenderMode.OPENGL)

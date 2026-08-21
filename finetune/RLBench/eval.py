@@ -281,6 +281,14 @@ def eval(
         # report summaries
         summaries = []
         summaries.extend(stats_accumulator.pop())
+
+        # SimpleAccumulator.pop() returns nothing for a single episode.
+        # Use peak() so single-episode evaluation can still obtain
+        # scalar summaries and VideoSummary, then clear the accumulator.
+        if len(summaries) == 0 and len(task_rewards) > 0:
+            summaries.extend(stats_accumulator.peak())
+            stats_accumulator.reset()
+
         task_name = tasks[task_id]
         if logging:
             # writer csv first

@@ -1,0 +1,21 @@
+debug: false
+device: 0
+episode_length: 25
+eval_datafolder: ''
+eval_episodes: 25
+eval_log_dir: eval/test/1
+exp_cfg_path: null
+ground_truth: false
+headless: true
+log_name: test/1
+model_folder: ''
+model_name: model_80.pth
+mvt_cfg_path: null
+save_video: false
+skip: false
+start_episode: 0
+tasks:
+- all
+use_input_place_with_mean: false
+visualize: false
+visualize_root_dir: ''
