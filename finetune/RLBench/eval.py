@@ -68,7 +68,11 @@ def load_agent(
     mvt_cfg_path=None,
     eval_log_dir="",
     device=0,
-    use_input_place_with_mean=False):
+    use_input_place_with_mean=False,
+    pmf_enabled=False,
+    pmf_prior_var=9e-4,
+    pmf_observation_var=1e-4,
+):
     device = f"cuda:{device}"
     assert model_path is not None
 
@@ -117,6 +121,9 @@ def load_agent(
         scene_bounds=SCENE_BOUNDS,
         cameras=CAMERAS,
         log_dir=f"{eval_log_dir}/eval_run",
+        pmf_enabled=pmf_enabled,
+        pmf_prior_var=pmf_prior_var,
+        pmf_observation_var=pmf_observation_var,
         **exp_cfg.peract,
         **exp_cfg.rvt,
     )
@@ -421,6 +428,9 @@ def _eval(args):
             eval_log_dir=args.eval_log_dir,
             device=args.device,
             use_input_place_with_mean=args.use_input_place_with_mean,
+            pmf_enabled=args.pmf_enabled,
+            pmf_prior_var=args.pmf_prior_var,
+            pmf_observation_var=args.pmf_observation_var,
         )
 
         agent_eval_log_dir = os.path.join(

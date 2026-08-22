@@ -415,6 +415,9 @@ class RVTAgent:
         rot_ver: int = 0,
         rot_x_y_aug: int = 2,
         log_dir="",
+        pmf_enabled: bool = False,
+        pmf_prior_var: float = 9e-4,
+        pmf_observation_var: float = 1e-4,
     ):
         self._network = network
         self._num_rotation_classes = num_rotation_classes
@@ -444,6 +447,22 @@ class RVTAgent:
         self.move_pc_in_bound = move_pc_in_bound
         self.rot_ver = rot_ver
         self.rot_x_y_aug = rot_x_y_aug
+        if pmf_prior_var <= 0:
+            raise ValueError("pmf_prior_var must be greater than 0")
+        if pmf_observation_var <= 0:
+            raise ValueError("pmf_observation_var must be greater than 0")
+        self.pmf_enabled = pmf_enabled
+        self.pmf_prior_var = pmf_prior_var
+        self.pmf_observation_var = pmf_observation_var
+        self.pmf_gain = pmf_prior_var / (pmf_prior_var + pmf_observation_var)
+        self._pmf_prev_prev_wpt = None
+        self._pmf_prev_wpt = None
+        if self.pmf_enabled:
+            print(
+                f"[PMF] enabled | prior_var={self.pmf_prior_var:g} | "
+                f"observation_var={self.pmf_observation_var:g} | "
+                f"gain={self.pmf_gain:g}"
+            )
 
         self._cross_entropy_loss = nn.CrossEntropyLoss(reduction="none")
         if isinstance(self._network, DistributedDataParallel):
@@ -1044,6 +1063,7 @@ class RVTAgent:
         pred_wpt, pred_rot_quat, pred_grip, pred_coll = self.get_pred(
             out, rot_q, grip_q, collision_q, y_q, rev_trans, dyn_cam_info
         )
+        pred_wpt = self._apply_prob_motion_filter(pred_wpt)
         if visualize:
             print("Visualizing")
             save_dir=visualize_save_dir
@@ -1136,6 +1156,21 @@ class RVTAgent:
 
         return pred_wpt, pred_rot_quat, pred_grip, pred_coll
 
+    def _apply_prob_motion_filter(self, pred_wpt: torch.Tensor) -> torch.Tensor:
+        if not self.pmf_enabled:
+            return pred_wpt
+
+        filtered_wpt = pred_wpt.clone()
+        if self._pmf_prev_prev_wpt is not None and self._pmf_prev_wpt is not None:
+            prior_mean = 2 * self._pmf_prev_wpt - self._pmf_prev_prev_wpt
+            filtered_wpt = prior_mean + self.pmf_gain * (
+                filtered_wpt - prior_mean
+            )
+
+        self._pmf_prev_prev_wpt = self._pmf_prev_wpt
+        self._pmf_prev_wpt = filtered_wpt.detach().clone()
+        return filtered_wpt
+
 
     @torch.no_grad()
     def get_action_trans(
@@ -1183,7 +1218,8 @@ class RVTAgent:
 
 
     def reset(self):
-        pass
+        self._pmf_prev_prev_wpt = None
+        self._pmf_prev_wpt = None
 
     def eval(self):
         self._network.eval()
