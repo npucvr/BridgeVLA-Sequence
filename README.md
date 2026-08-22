@@ -105,11 +105,26 @@ bash train.sh --exp_cfg_path  configs/gembench_config.yaml \
               --pretrain_path  PATH_TO_PRETRAINED_MODEL
 ```
 ## 🧪 Evaluation
-1. **RLBench Evaluation:** To evaluate on RLBench, you can just run the following code:
+1. **RLBench Evaluation:** To reproduce the paper's 25-trial RLBench results, use the held-out evaluation dataset [`LPY/BridgeVLA_RLBench_EVAL_DATA`](https://huggingface.co/datasets/LPY/BridgeVLA_RLBench_EVAL_DATA/tree/main), not [`RLBench_TRAIN_DATA`](https://huggingface.co/datasets/LPY/BridgeVLA_RLBench_TRAIN_DATA/tree/main). The latter contains the 100 demonstrations used for fine-tuning. Extract the 25 episodes from the evaluation archives into the task-root layout expected by `eval.py`:
+```bash
+DATA_DIR=/PATH/TO/RLBench_EVAL_DATA \
+  bash scripts/rlbench_repro/extract_eval_data.sh
+```
+You can then run the original evaluator as follows:
 ```bash
 cd finetune/RLBench
-bash eval.sh # Please modify the evaluated tasks and the checkpoint path in the file.
+bash eval.sh # modify the evaluated tasks, checkpoint, and held-out eval-data path.
 ```
+For the released `model_80.pth`, the audited five-run command is:
+```bash
+EVAL_DATAFOLDER=/PATH/TO/RLBench_EVAL_DATA \
+RESULT_LOG_DIR=rlbench_eval_split \
+  bash scripts/rlbench_repro/run_5_parallel.sh
+```
+Set `GPU_IDS=0,2` to use two concurrent slots, or `GPU_IDS=0` for sequential
+repeats when sharing a GPU; the launcher schedules five runs in waves. When
+running multiple CoppeliaSim instances, map isolated displays, for example
+`GPU_IDS=0,2 DISPLAY_IDS=:1.0,:2.0`.
 2. **COLOSSEUM Evaluation:** To evaluate on COLOSSEUM, you should first preprocess the eval data as the original format is not suitable for our data loading. Run the following code to preprocess them. Or you can directly download the cleaned data we have tided from [here](https://huggingface.co/datasets/LPY/BridgeVLA_COLOSSUM_EVAL_DATA/tree/main).
 ```bash
 cd finetune/Colosseum

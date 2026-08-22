@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Verify that every RLBench eval task has complete episodes 0..24.
+"""Verify held-out RLBench eval episodes and camera-file consistency.
 
 For each episode, load low_dim_obs.pkl and compare observation length with
 the number of files in the camera directories checked by RLBench's
 get_stored_demos(). This is the same consistency check eval will perform.
+Use --exact-episodes to reject accidentally passing the 100-demo training
+split to the paper's 25-episode evaluation protocol.
 """
 import argparse
 import os
@@ -55,12 +57,33 @@ def main():
     ap.add_argument("--tasks", nargs="+", default=TASKS)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--episodes", type=int, default=25)
+    ap.add_argument(
+        "--exact-episodes",
+        action="store_true",
+        help="also fail if a task directory contains episodes outside the requested range",
+    )
     args = ap.parse_args()
 
     root = Path(args.data_folder)
     all_ok = True
+    expected = set(range(args.start, args.start + args.episodes))
     for task in args.tasks:
         task_ok = True
+        if args.exact_episodes:
+            episodes_dir = root / task / "all_variations" / "episodes"
+            actual = {
+                int(p.name[len("episode"):])
+                for p in episodes_dir.glob("episode*")
+                if p.is_dir() and p.name[len("episode"):].isdigit()
+            }
+            extra = sorted(actual - expected)
+            missing = sorted(expected - actual)
+            if missing:
+                print(f"[MISSING-EPISODES] {task}: {missing}")
+                all_ok = task_ok = False
+            if extra:
+                print(f"[EXTRA-EPISODES] {task}: {extra}")
+                all_ok = task_ok = False
         for ep in range(args.start, args.start + args.episodes):
             ep_dir = root / task / "all_variations" / "episodes" / f"episode{ep}"
             if not ep_dir.is_dir():

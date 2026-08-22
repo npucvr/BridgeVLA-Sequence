@@ -5,11 +5,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 LOG_FILE="${LOG_FILE:-/tmp/bridgevla_rlbench_repro_5runs.log}"
 PYTHON="${PYTHON:-/home/sunguodong/.conda/envs/bridgevla/bin/python}"
+EVAL_DATAFOLDER="${EVAL_DATAFOLDER:-$REPO_ROOT/data/RLBench_EVAL_DATA}"
+RESULT_LOG_DIR="${RESULT_LOG_DIR:-rlbench_repro}"
+export EVAL_DATAFOLDER RESULT_LOG_DIR
 MIN_CPU_AVAIL_MB="${MIN_CPU_AVAIL_MB:-51200}"
 
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
 source "$REPO_ROOT/env.sh" >/dev/null 2>&1
 EXTRACT_LOG="${EXTRACT_LOG:-/tmp/bridgevla_extract_eval_data.log}"
+echo "[scheduler] eval data: $EVAL_DATAFOLDER" >> "$LOG_FILE"
 echo "[scheduler] start $(date)" >> "$LOG_FILE"
 
 wait_for_extract() {
@@ -23,7 +27,8 @@ wait_for_extract() {
 wait_for_data() {
   while true; do
     if "$PYTHON" "$SCRIPT_DIR/verify_eval_data.py" \
-        --data-folder "$REPO_ROOT/data/RLBench_TRAIN_DATA" >> "$LOG_FILE" 2>&1; then
+        --data-folder "$EVAL_DATAFOLDER" \
+        --exact-episodes >> "$LOG_FILE" 2>&1; then
       echo "[scheduler] eval data verified $(date)" >> "$LOG_FILE"
       return 0
     fi
@@ -71,6 +76,7 @@ done
 echo "[scheduler] all runs done $(date)" >> "$LOG_FILE"
 "$PYTHON" "$SCRIPT_DIR/aggregate_runs.py" \
   --model-folder "$REPO_ROOT/data/bridgevla_ckpt/bridgevla/rlbench" \
+  --log-dir "$RESULT_LOG_DIR" \
   --runs 1,2,3,4,5 > /tmp/bridgevla_rlbench_aggregate.txt 2>&1
 cat /tmp/bridgevla_rlbench_aggregate.txt >> "$LOG_FILE"
 "$PYTHON" "$SCRIPT_DIR/compare_to_paper.py" \

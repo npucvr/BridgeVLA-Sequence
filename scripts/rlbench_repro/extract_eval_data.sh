@@ -1,11 +1,14 @@
 #!/bin/bash
-# Extract only episodes 0-24 for each RLBench task. Evaluation uses 25 demos
-# per task per run, starting from episode 0.
+# Extract the 25 held-out evaluation episodes (0-24) for each RLBench task.
+# The published EVAL_DATA files are gzip-compressed despite their .tar.xz
+# suffix. Do not point this at RLBench_TRAIN_DATA: that archive contains the
+# 100 demonstrations used for fine-tuning, not the paper's held-out set.
 set -u
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
-DATA_DIR="$REPO_ROOT/data/RLBench_TRAIN_DATA"
+DATA_DIR="${DATA_DIR:-$REPO_ROOT/data/RLBench_EVAL_DATA}"
+LOG_FILE="${LOG_FILE:-/tmp/bridgevla_extract_eval_data.log}"
 PARALLEL="${PARALLEL:-4}"
 
 TASKS=(
@@ -47,10 +50,24 @@ extract_one() {
   fi
 
   echo "[start] $task $(date +%H:%M:%S)"
-  if nice -n 19 ionice -c3 tar -xJf "$tar_file" -C "$DATA_DIR" --wildcards \
-      "${task}/all_variations/episodes/episode[0-9]/*" \
-      "${task}/all_variations/episodes/episode1[0-9]/*" \
-      "${task}/all_variations/episodes/episode2[0-4]/*"; then
+  # Most EVAL_DATA archives preserve the generator's absolute-path prefix:
+  # mnt/hdfs/lpy/RLBench/peract_dataset/peract_18tasks/all_variations_128/
+  # eval_upload/<task>/.... One released archive has a ./<task>/ prefix, so
+  # detect both layouts and strip only the prefix components.
+  archive_prefix="mnt/hdfs/lpy/RLBench/peract_dataset/peract_18tasks/all_variations_128/eval_upload"
+  strip_components=8
+  first_entry="$(tar -tzf "$tar_file" | sed -n '1p')"
+  if [[ "$first_entry" == "./${task}/"* ]]; then
+    archive_prefix="."
+    strip_components=1
+  elif [[ "$first_entry" != "${archive_prefix}/${task}/"* ]]; then
+    echo "[FAIL] $task unsupported archive prefix: $first_entry"
+    return 1
+  fi
+  if nice -n 19 ionice -c3 tar -xzf "$tar_file" -C "$DATA_DIR" --strip-components="$strip_components" --wildcards \
+      "${archive_prefix}/${task}/all_variations/episodes/episode[0-9]/*" \
+      "${archive_prefix}/${task}/all_variations/episodes/episode1[0-9]/*" \
+      "${archive_prefix}/${task}/all_variations/episodes/episode2[0-4]/*"; then
     if have_episodes_0_24 "$task"; then
       echo "[done]  $task $(date +%H:%M:%S)"
     else

@@ -15,9 +15,21 @@ set -euo pipefail
 
 cd "$REPO_ROOT/finetune/RLBench"
 
-MODEL_FOLDER="$REPO_ROOT/data/bridgevla_ckpt/bridgevla/rlbench"
-EVAL_DATAFOLDER="$REPO_ROOT/data/RLBench_TRAIN_DATA"
-LOG_NAME="rlbench_repro/run_${RUN_ID}"
+MODEL_FOLDER="${MODEL_FOLDER:-$REPO_ROOT/data/bridgevla_ckpt/bridgevla/rlbench}"
+# The released TRAIN_DATA contains the 100 training demonstrations.  The
+# paper evaluates on the separate held-out EVAL_DATA split (25 episodes).
+EVAL_DATAFOLDER="${EVAL_DATAFOLDER:-$REPO_ROOT/data/RLBench_EVAL_DATA}"
+RESULT_LOG_DIR="${RESULT_LOG_DIR:-rlbench_repro}"
+LOG_NAME="${LOG_NAME:-$RESULT_LOG_DIR/run_${RUN_ID}}"
+
+if [ ! -d "$EVAL_DATAFOLDER" ]; then
+  echo "Evaluation data directory does not exist: $EVAL_DATAFOLDER" >&2
+  echo "Download LPY/BridgeVLA_RLBench_EVAL_DATA and extract episodes 0-24." >&2
+  exit 2
+fi
+if [[ "$EVAL_DATAFOLDER" == *"RLBench_TRAIN_DATA"* ]]; then
+  echo "WARNING: evaluating on RLBench_TRAIN_DATA; use the held-out RLBench_EVAL_DATA split for paper comparison." >&2
+fi
 
 export TF_CPP_MIN_LOG_LEVEL=3
 export BITSANDBYTES_NOWELCOME=1
