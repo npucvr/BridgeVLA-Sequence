@@ -17,6 +17,7 @@ Author: Peiyan Li
 Email: peiyan.li@cripac.ia.ac.cn
 '''
 
+import csv
 import pprint
 import torch
 import numpy as np
@@ -392,6 +393,26 @@ def print_loss_log(agent):
 
 
 class RVTAgent:
+    PMF_DIAGNOSTICS_STEP_FIELDS = [
+        "mode", "task", "episode", "action_idx", "warmup", "success", "reward",
+        "raw_x", "raw_y", "raw_z",
+        "pmf_prior_x", "pmf_prior_y", "pmf_prior_z",
+        "pmf_candidate_x", "pmf_candidate_y", "pmf_candidate_z",
+        "executed_x", "executed_y", "executed_z",
+        "raw_prior_x", "raw_prior_y", "raw_prior_z",
+        "innovation_m", "candidate_correction_m", "executed_correction_m",
+        "pmf_consistency_error_m", "history_prior_diff_m",
+        "prev_raw_step_length_m", "raw_step_length_m", "step_length_ratio",
+        "turn_angle_deg", "pred_gripper", "gripper_changed",
+        "rot_qx", "rot_qy", "rot_qz", "rot_qw", "rotation_change_deg",
+        "ee_before_x", "ee_before_y", "ee_before_z",
+        "ee_after_x", "ee_after_y", "ee_after_z", "pred_collision",
+    ]
+    PMF_DIAGNOSTICS_EPISODE_FIELDS = [
+        "mode", "task", "episode", "reward", "success", "episode_length",
+        "num_actions", "language_goal",
+    ]
+
     def __init__(
         self,
         network: nn.Module,
@@ -418,6 +439,9 @@ class RVTAgent:
         pmf_enabled: bool = False,
         pmf_prior_var: float = 9e-4,
         pmf_observation_var: float = 1e-4,
+        pmf_diagnostics_enabled: bool = False,
+        pmf_diagnostics_mode: str = None,
+        pmf_diagnostics_log_dir: str = None,
     ):
         self._network = network
         self._num_rotation_classes = num_rotation_classes
@@ -457,6 +481,23 @@ class RVTAgent:
         self.pmf_gain = pmf_prior_var / (pmf_prior_var + pmf_observation_var)
         self._pmf_prev_prev_wpt = None
         self._pmf_prev_wpt = None
+        self.pmf_diagnostics_enabled = pmf_diagnostics_enabled
+        self.pmf_diagnostics_mode = pmf_diagnostics_mode
+        self.pmf_diagnostics_log_dir = pmf_diagnostics_log_dir
+        self._diag_task = None
+        self._diag_episode = None
+        if self.pmf_diagnostics_enabled:
+            if self.pmf_diagnostics_mode not in ("shadow", "pmf"):
+                raise ValueError(
+                    "pmf_diagnostics_mode must be 'shadow' or 'pmf' when diagnostics are enabled"
+                )
+            if self.pmf_diagnostics_mode == "shadow" and self.pmf_enabled:
+                raise ValueError("shadow diagnostics require pmf_enabled=False")
+            if self.pmf_diagnostics_mode == "pmf" and not self.pmf_enabled:
+                raise ValueError("pmf diagnostics require pmf_enabled=True")
+            if not self.pmf_diagnostics_log_dir:
+                raise ValueError("pmf_diagnostics_log_dir is required when diagnostics are enabled")
+            self._reset_pmf_diagnostics_episode_state()
         if self.pmf_enabled:
             print(
                 f"[PMF] enabled | prior_var={self.pmf_prior_var:g} | "
@@ -1018,6 +1059,9 @@ class RVTAgent:
     def act(
         self, step: int, observation: dict,visualize=False,visualize_save_dir="", return_gembench_action=False,
     ) -> ActResult:
+        diag_ee_before = None
+        if self.pmf_diagnostics_enabled:
+            diag_ee_before = self._extract_diagnostics_ee_xyz(observation)
         language_goal =observation["language_goal"]
         obs, pcd = rlbench_utils._preprocess_inputs(observation, self.cameras)
         pc, img_feat = rvt_utils.get_pc_img_feat(
@@ -1063,7 +1107,18 @@ class RVTAgent:
         pred_wpt, pred_rot_quat, pred_grip, pred_coll = self.get_pred(
             out, rot_q, grip_q, collision_q, y_q, rev_trans, dyn_cam_info
         )
+        diagnostics_step = None
+        if self.pmf_diagnostics_enabled:
+            diagnostics_step = self._prepare_pmf_diagnostics_step(
+                raw_wpt=pred_wpt,
+                pred_rot_quat=pred_rot_quat,
+                pred_grip=pred_grip,
+                pred_coll=pred_coll,
+                ee_before=diag_ee_before,
+            )
         pred_wpt = self._apply_prob_motion_filter(pred_wpt)
+        if diagnostics_step is not None:
+            self._finish_pmf_diagnostics_step(diagnostics_step, pred_wpt)
         if visualize:
             print("Visualizing")
             save_dir=visualize_save_dir
@@ -1156,6 +1211,280 @@ class RVTAgent:
 
         return pred_wpt, pred_rot_quat, pred_grip, pred_coll
 
+    def set_diagnostics_context(self, task_name: str, episode: int):
+        if not self.pmf_diagnostics_enabled:
+            return
+        self._diag_task = task_name
+        self._diag_episode = int(episode)
+
+    def _reset_pmf_diagnostics_episode_state(self):
+        self._diag_prev_prev_raw_wpt = None
+        self._diag_prev_raw_wpt = None
+        self._diag_prev_prev_shadow_wpt = None
+        self._diag_prev_shadow_wpt = None
+        self._diag_prev_rot_quat = None
+        self._diag_prev_gripper = None
+        self._diag_episode_rows = []
+
+    @staticmethod
+    def _extract_diagnostics_ee_xyz(observation):
+        gripper_pose = observation.get("gripper_pose")
+        if gripper_pose is None:
+            return None
+        if isinstance(gripper_pose, torch.Tensor):
+            gripper_pose = gripper_pose.detach().cpu().numpy()
+        pose = np.asarray(gripper_pose)
+        if pose.size < 3:
+            return None
+        if pose.ndim == 1:
+            xyz = pose[:3]
+        else:
+            if pose.shape[-1] < 3:
+                return None
+            xyz = pose.reshape(-1, pose.shape[-1])[-1, :3]
+        xyz = np.asarray(xyz, dtype=np.float64)
+        if not np.all(np.isfinite(xyz)):
+            return None
+        return xyz
+
+    @staticmethod
+    def _diagnostics_rotation_change_deg(previous, current):
+        if previous is None:
+            return float("nan")
+        previous = np.asarray(previous, dtype=np.float64)
+        current = np.asarray(current, dtype=np.float64)
+        previous_norm = np.linalg.norm(previous)
+        current_norm = np.linalg.norm(current)
+        if previous_norm <= 1e-12 or current_norm <= 1e-12:
+            return float("nan")
+        dot = abs(float(np.dot(previous / previous_norm, current / current_norm)))
+        dot = float(np.clip(dot, 0.0, 1.0))
+        return float(np.degrees(2.0 * np.arccos(dot)))
+
+    @staticmethod
+    def _diagnostics_turn_angle_deg(v_prev, v_curr):
+        prev_norm = float(np.linalg.norm(v_prev))
+        curr_norm = float(np.linalg.norm(v_curr))
+        if prev_norm <= 1e-12 or curr_norm <= 1e-12:
+            return float("nan")
+        cosine = float(np.dot(v_prev, v_curr) / (prev_norm * curr_norm))
+        cosine = float(np.clip(cosine, -1.0, 1.0))
+        return float(np.degrees(np.arccos(cosine)))
+
+    @staticmethod
+    def _diagnostics_xyz(prefix, value):
+        if value is None:
+            return {
+                f"{prefix}_x": float("nan"),
+                f"{prefix}_y": float("nan"),
+                f"{prefix}_z": float("nan"),
+            }
+        value = np.asarray(value, dtype=np.float64)
+        return {
+            f"{prefix}_x": float(value[0]),
+            f"{prefix}_y": float(value[1]),
+            f"{prefix}_z": float(value[2]),
+        }
+
+    def _prepare_pmf_diagnostics_step(
+        self, raw_wpt, pred_rot_quat, pred_grip, pred_coll, ee_before
+    ):
+        if self._diag_task is None or self._diag_episode is None:
+            raise RuntimeError("diagnostics context must be set before agent.act()")
+
+        if self._diag_episode_rows and ee_before is not None:
+            self._diag_episode_rows[-1].update(
+                self._diagnostics_xyz("ee_after", ee_before)
+            )
+
+        raw_tensor = raw_wpt.detach().clone()
+        raw = raw_tensor[0].cpu().numpy().astype(np.float64)
+        raw_prior_tensor = None
+        if self._diag_prev_prev_raw_wpt is not None and self._diag_prev_raw_wpt is not None:
+            raw_prior_tensor = (
+                2 * self._diag_prev_raw_wpt - self._diag_prev_prev_raw_wpt
+            )
+
+        if self.pmf_diagnostics_mode == "shadow":
+            history_prev_prev = self._diag_prev_prev_shadow_wpt
+            history_prev = self._diag_prev_shadow_wpt
+        else:
+            history_prev_prev = self._pmf_prev_prev_wpt
+            history_prev = self._pmf_prev_wpt
+
+        warmup = history_prev_prev is None or history_prev is None
+        prior_tensor = None
+        candidate_tensor = raw_tensor.clone()
+        if not warmup:
+            prior_tensor = 2 * history_prev - history_prev_prev
+            candidate_tensor = prior_tensor + self.pmf_gain * (
+                raw_tensor - prior_tensor
+            )
+
+        if self.pmf_diagnostics_mode == "shadow":
+            self._diag_prev_prev_shadow_wpt = self._diag_prev_shadow_wpt
+            self._diag_prev_shadow_wpt = candidate_tensor.detach().clone()
+
+        prior = None if prior_tensor is None else prior_tensor[0].cpu().numpy()
+        candidate = candidate_tensor[0].cpu().numpy()
+        raw_prior = (
+            None
+            if raw_prior_tensor is None
+            else raw_prior_tensor[0].cpu().numpy()
+        )
+
+        raw_step_length = float("nan")
+        prev_raw_step_length = float("nan")
+        step_length_ratio = float("nan")
+        turn_angle = float("nan")
+        if self._diag_prev_raw_wpt is not None:
+            v_curr = raw - self._diag_prev_raw_wpt[0].cpu().numpy()
+            raw_step_length = float(np.linalg.norm(v_curr))
+            if self._diag_prev_prev_raw_wpt is not None:
+                v_prev = (
+                    self._diag_prev_raw_wpt[0].cpu().numpy()
+                    - self._diag_prev_prev_raw_wpt[0].cpu().numpy()
+                )
+                prev_raw_step_length = float(np.linalg.norm(v_prev))
+                if prev_raw_step_length > 1e-12:
+                    step_length_ratio = raw_step_length / (
+                        prev_raw_step_length + 1e-12
+                    )
+                turn_angle = self._diagnostics_turn_angle_deg(v_prev, v_curr)
+
+        rotation = np.asarray(pred_rot_quat[0], dtype=np.float64)
+        gripper = int(pred_grip[0].detach().cpu().reshape(-1)[0].item())
+        collision = int(pred_coll[0].detach().cpu().reshape(-1)[0].item())
+        rotation_change = self._diagnostics_rotation_change_deg(
+            self._diag_prev_rot_quat, rotation
+        )
+        gripper_changed = (
+            0 if self._diag_prev_gripper is None else int(gripper != self._diag_prev_gripper)
+        )
+
+        innovation = float("nan") if prior is None else float(np.linalg.norm(raw - prior))
+        candidate_correction = float(np.linalg.norm(candidate - raw))
+        history_prior_diff = (
+            float("nan")
+            if prior is None or raw_prior is None
+            else float(np.linalg.norm(prior - raw_prior))
+        )
+
+        row = {
+            "mode": self.pmf_diagnostics_mode,
+            "task": self._diag_task,
+            "episode": self._diag_episode,
+            "action_idx": len(self._diag_episode_rows),
+            "warmup": int(warmup),
+            "success": "",
+            "reward": "",
+            "innovation_m": innovation,
+            "candidate_correction_m": candidate_correction,
+            "executed_correction_m": float("nan"),
+            "pmf_consistency_error_m": float("nan"),
+            "history_prior_diff_m": history_prior_diff,
+            "prev_raw_step_length_m": prev_raw_step_length,
+            "raw_step_length_m": raw_step_length,
+            "step_length_ratio": step_length_ratio,
+            "turn_angle_deg": turn_angle,
+            "pred_gripper": gripper,
+            "gripper_changed": gripper_changed,
+            "rot_qx": float(rotation[0]),
+            "rot_qy": float(rotation[1]),
+            "rot_qz": float(rotation[2]),
+            "rot_qw": float(rotation[3]),
+            "rotation_change_deg": rotation_change,
+            "pred_collision": collision,
+        }
+        row.update(self._diagnostics_xyz("raw", raw))
+        row.update(self._diagnostics_xyz("pmf_prior", prior))
+        row.update(self._diagnostics_xyz("pmf_candidate", candidate))
+        row.update(self._diagnostics_xyz("executed", None))
+        row.update(self._diagnostics_xyz("raw_prior", raw_prior))
+        row.update(self._diagnostics_xyz("ee_before", ee_before))
+        row.update(self._diagnostics_xyz("ee_after", None))
+
+        self._diag_prev_prev_raw_wpt = self._diag_prev_raw_wpt
+        self._diag_prev_raw_wpt = raw_tensor.detach().clone()
+        self._diag_prev_rot_quat = rotation.copy()
+        self._diag_prev_gripper = gripper
+        return {"row": row, "raw": raw, "candidate": candidate}
+
+    def _finish_pmf_diagnostics_step(self, diagnostics_step, executed_wpt):
+        row = diagnostics_step["row"]
+        raw = diagnostics_step["raw"]
+        candidate = diagnostics_step["candidate"]
+        executed = executed_wpt[0].detach().cpu().numpy().astype(np.float64)
+        row.update(self._diagnostics_xyz("executed", executed))
+        row["executed_correction_m"] = float(np.linalg.norm(executed - raw))
+        if self.pmf_diagnostics_mode == "pmf":
+            row["pmf_consistency_error_m"] = float(
+                np.linalg.norm(candidate - executed)
+            )
+        self._diag_episode_rows.append(row)
+
+    @staticmethod
+    def _append_diagnostics_csv(path, fieldnames, rows):
+        has_header = os.path.isfile(path) and os.path.getsize(path) > 0
+        with open(path, "a", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            if not has_header:
+                writer.writeheader()
+            writer.writerows(rows)
+
+    def finalize_diagnostics_episode(
+        self, reward, episode_length, language_goal, final_observation=None
+    ):
+        if not self.pmf_diagnostics_enabled:
+            return
+        if self._diag_task is None or self._diag_episode is None:
+            raise RuntimeError("diagnostics context is missing at episode finalize")
+
+        final_ee = (
+            None
+            if final_observation is None
+            else self._extract_diagnostics_ee_xyz(final_observation)
+        )
+        if self._diag_episode_rows and final_ee is not None:
+            self._diag_episode_rows[-1].update(
+                self._diagnostics_xyz("ee_after", final_ee)
+            )
+
+        reward = float(reward)
+        success = int(reward > 0)
+        for row in self._diag_episode_rows:
+            row["reward"] = reward
+            row["success"] = success
+
+        os.makedirs(self.pmf_diagnostics_log_dir, exist_ok=True)
+        steps_path = os.path.join(
+            self.pmf_diagnostics_log_dir, "pmf_diagnostics_steps.csv"
+        )
+        episodes_path = os.path.join(
+            self.pmf_diagnostics_log_dir, "pmf_diagnostics_episodes.csv"
+        )
+        self._append_diagnostics_csv(
+            steps_path,
+            self.PMF_DIAGNOSTICS_STEP_FIELDS,
+            self._diag_episode_rows,
+        )
+        episode_row = {
+            "mode": self.pmf_diagnostics_mode,
+            "task": self._diag_task,
+            "episode": self._diag_episode,
+            "reward": reward,
+            "success": success,
+            "episode_length": int(episode_length),
+            "num_actions": len(self._diag_episode_rows),
+            "language_goal": language_goal,
+        }
+        self._append_diagnostics_csv(
+            episodes_path,
+            self.PMF_DIAGNOSTICS_EPISODE_FIELDS,
+            [episode_row],
+        )
+        self._diag_episode_rows = []
+
     def _apply_prob_motion_filter(self, pred_wpt: torch.Tensor) -> torch.Tensor:
         if not self.pmf_enabled:
             return pred_wpt
@@ -1220,6 +1549,8 @@ class RVTAgent:
     def reset(self):
         self._pmf_prev_prev_wpt = None
         self._pmf_prev_wpt = None
+        if self.pmf_diagnostics_enabled:
+            self._reset_pmf_diagnostics_episode_state()
 
     def eval(self):
         self._network.eval()

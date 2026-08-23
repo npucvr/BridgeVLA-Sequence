@@ -72,6 +72,9 @@ def load_agent(
     pmf_enabled=False,
     pmf_prior_var=9e-4,
     pmf_observation_var=1e-4,
+    pmf_diagnostics_enabled=False,
+    pmf_diagnostics_mode=None,
+    pmf_diagnostics_log_dir=None,
 ):
     device = f"cuda:{device}"
     assert model_path is not None
@@ -124,6 +127,9 @@ def load_agent(
         pmf_enabled=pmf_enabled,
         pmf_prior_var=pmf_prior_var,
         pmf_observation_var=pmf_observation_var,
+        pmf_diagnostics_enabled=pmf_diagnostics_enabled,
+        pmf_diagnostics_mode=pmf_diagnostics_mode,
+        pmf_diagnostics_log_dir=pmf_diagnostics_log_dir,
         **exp_cfg.peract,
         **exp_cfg.rvt,
     )
@@ -230,6 +236,9 @@ def eval(
         language_goals=[]
         for ep in range(start_episode, start_episode + eval_episodes):
             episode_rollout = []
+            task_name = tasks[task_id]
+            if agent.pmf_diagnostics_enabled:
+                agent.set_diagnostics_context(task_name=task_name, episode=ep)
             if not visualize:
                 generator = rollout_generator.generator(
                     step_signal=step_signal,
@@ -275,11 +284,17 @@ def eval(
                 current_task_id = transition.info["active_task_id"]
                 assert current_task_id == task_id
 
-            task_name = tasks[task_id]
             reward = episode_rollout[-1].reward
             task_rewards.append(reward)
             lang_goal = eval_env._lang_goal
             language_goals.append(lang_goal)
+            if agent.pmf_diagnostics_enabled:
+                agent.finalize_diagnostics_episode(
+                    reward=reward,
+                    episode_length=len(episode_rollout),
+                    language_goal=lang_goal,
+                    final_observation=episode_rollout[-1].final_observation,
+                )
             if verbose:
                 print(
                     f"Evaluating {task_name} | Episode {ep} | Score: {reward} | Episode Length: {len(episode_rollout)} | Lang Goal: {lang_goal}"
@@ -408,6 +423,23 @@ def get_model_index(filename):
     return index
 
 
+def validate_pmf_diagnostics_args(args):
+    if not args.pmf_diagnostics_enabled:
+        if args.pmf_diagnostics_mode is not None:
+            raise ValueError(
+                "--pmf-diagnostics-mode requires --pmf-diagnostics-enabled"
+            )
+        return
+    if args.pmf_diagnostics_mode is None:
+        raise ValueError(
+            "--pmf-diagnostics-mode is required when diagnostics are enabled"
+        )
+    if args.pmf_diagnostics_mode == "shadow" and args.pmf_enabled:
+        raise ValueError("shadow diagnostics require PMF execution to be disabled")
+    if args.pmf_diagnostics_mode == "pmf" and not args.pmf_enabled:
+        raise ValueError("pmf diagnostics require --pmf-enabled")
+
+
 def _eval(args):
 
     model_paths = []
@@ -421,6 +453,10 @@ def _eval(args):
             model_idx = 0
 
   
+        agent_eval_log_dir = os.path.join(
+            args.eval_log_dir, os.path.basename(model_path).split(".")[0]
+        )
+
         agent = load_agent(
             model_path=model_path,
             exp_cfg_path=args.exp_cfg_path,
@@ -431,13 +467,10 @@ def _eval(args):
             pmf_enabled=args.pmf_enabled,
             pmf_prior_var=args.pmf_prior_var,
             pmf_observation_var=args.pmf_observation_var,
+            pmf_diagnostics_enabled=args.pmf_diagnostics_enabled,
+            pmf_diagnostics_mode=args.pmf_diagnostics_mode,
+            pmf_diagnostics_log_dir=agent_eval_log_dir,
         )
-
-        agent_eval_log_dir = os.path.join(
-            args.eval_log_dir, os.path.basename(model_path).split(".")[0]
-        )
-
-
         os.makedirs(agent_eval_log_dir, exist_ok=True)
         scores = eval(
             agent=agent,
@@ -473,6 +506,11 @@ if __name__ == "__main__":
     parser = get_eval_parser()
 
     args = parser.parse_args()
+
+    try:
+        validate_pmf_diagnostics_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.log_name is None:
         args.log_name = "none"

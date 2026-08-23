@@ -160,6 +160,12 @@ def get_eval_parser():
     parser.add_argument("--pmf-enabled", action="store_true", default=False)
     parser.add_argument("--pmf-prior-var", type=float, default=9e-4)
     parser.add_argument("--pmf-observation-var", type=float, default=1e-4)
+    parser.add_argument(
+        "--pmf-diagnostics-enabled", action="store_true", default=False
+    )
+    parser.add_argument(
+        "--pmf-diagnostics-mode", choices=("shadow", "pmf"), default=None
+    )
     return parser
 
 
