@@ -93,11 +93,36 @@ TASKS=(
 # PMF / runtime configuration
 ###############################################################################
 
+PMF_ENABLED="${PMF_ENABLED:-1}"
 PMF_PRIOR_VAR="${PMF_PRIOR_VAR:-9e-4}"
 PMF_OBSERVATION_VAR="${PMF_OBSERVATION_VAR:-1e-4}"
+AGGREGATE_ONLY="${AGGREGATE_ONLY:-0}"
+EXISTING_RUN_ROOT="${EXISTING_RUN_ROOT:-}"
 CPU_THREADS="${CPU_THREADS:-4}"
 
-RUN_NAME="${RUN_NAME:-pmf_table1_3node_glfix_$(date +%Y%m%d_%H%M%S)}"
+if [[ "$PMF_ENABLED" != "0" && "$PMF_ENABLED" != "1" ]]; then
+    echo "ERROR: PMF_ENABLED must be 0 or 1."
+    exit 2
+fi
+
+if [[ "$AGGREGATE_ONLY" != "0" && "$AGGREGATE_ONLY" != "1" ]]; then
+    echo "ERROR: AGGREGATE_ONLY must be 0 or 1."
+    exit 2
+fi
+
+if [[ "$PMF_ENABLED" == "1" ]]; then
+    PMF_ENABLED_TEXT="true"
+    PMF_ENABLED_LABEL="yes"
+    EVALUATION_VARIANT="BridgeVLA + PMF"
+    DEFAULT_RUN_PREFIX="pmf"
+else
+    PMF_ENABLED_TEXT="false"
+    PMF_ENABLED_LABEL="no"
+    EVALUATION_VARIANT="BridgeVLA baseline"
+    DEFAULT_RUN_PREFIX="baseline"
+fi
+
+RUN_NAME="${RUN_NAME:-${DEFAULT_RUN_PREFIX}_table1_3node_glfix_$(date +%Y%m%d_%H%M%S)}"
 SHARED_EVAL_ROOT="${SHARED_EVAL_ROOT:-/remote_userdata/lizhe/VLA/BridgeVLA/multinode_eval}"
 REMOTE_CONDA_SH="${REMOTE_CONDA_SH:-/home/lizhe/miniconda3/etc/profile.d/conda.sh}"
 REMOTE_READY_TIMEOUT="${REMOTE_READY_TIMEOUT:-180}"
@@ -268,6 +293,196 @@ k = q / (q + r)
 print(f"PMF prior variance       : {q:g}")
 print(f"PMF observation variance : {r:g}")
 print(f"PMF gain K               : {k:.8f}")
+PY
+}
+
+aggregate_results() {
+    local aggregate_run_root="$1"
+
+    if [[ -z "${CONDA_PREFIX:-}" || ! -x "$CONDA_PREFIX/bin/python" ]]; then
+        echo "ERROR: explicit Conda Python is missing or not executable." >&2
+        return 2
+    fi
+
+    echo
+    echo "============================================================"
+    echo "Aggregating Table-1 statistics"
+    echo "============================================================"
+
+    "$CONDA_PREFIX/bin/python" - "$aggregate_run_root" "$MODEL_STEM" <<'PY'
+import csv
+import os
+import statistics
+import sys
+
+run_root = sys.argv[1]
+model_stem = sys.argv[2]
+
+tasks = [
+    "close_jar",
+    "reach_and_drag",
+    "insert_onto_square_peg",
+    "meat_off_grill",
+    "open_drawer",
+    "place_cups",
+    "place_wine_at_rack_location",
+    "push_buttons",
+    "put_groceries_in_cupboard",
+    "put_item_in_drawer",
+    "put_money_in_safe",
+    "light_bulb_in",
+    "slide_block_to_color_target",
+    "place_shape_in_shape_sorter",
+    "stack_blocks",
+    "stack_cups",
+    "sweep_to_dustpan_of_size",
+    "turn_tap",
+]
+
+n_runs = 5
+all_runs = {}
+errors = []
+
+for run_idx in range(1, n_runs + 1):
+    run_name = f"run_{run_idx:02d}"
+    csv_path = os.path.join(run_root, run_name, model_stem, "eval_results.csv")
+
+    if not os.path.isfile(csv_path):
+        errors.append(f"{run_name}: missing {csv_path}")
+        continue
+
+    run_results = {}
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            task = (row.get("task") or "").strip()
+            value = (row.get("success rate") or "").strip()
+            if not task:
+                continue
+            if task in run_results:
+                errors.append(f"{run_name}: duplicate task {task}")
+                continue
+            try:
+                value = float(value)
+            except ValueError:
+                errors.append(f"{run_name}: invalid success rate for {task}: {value!r}")
+                continue
+            run_results[task] = value
+
+    missing = [t for t in tasks if t not in run_results]
+    extra = [t for t in run_results if t not in tasks]
+    if missing:
+        errors.append(f"{run_name}: missing tasks: {', '.join(missing)}")
+    if extra:
+        errors.append(f"{run_name}: unexpected tasks: {', '.join(extra)}")
+    if not missing and not extra:
+        all_runs[run_idx] = run_results
+
+if errors:
+    print()
+    print("Aggregation errors:")
+    for e in errors:
+        print("  -", e)
+    print()
+
+if len(all_runs) != n_runs:
+    print(f"ERROR: only {len(all_runs)}/{n_runs} complete repetitions are available.")
+    sys.exit(2)
+
+per_run_csv = os.path.join(run_root, "table1_per_run.csv")
+summary_csv = os.path.join(run_root, "table1_summary.csv")
+summary_txt = os.path.join(run_root, "table1_summary.txt")
+
+with open(per_run_csv, "w", newline="") as f:
+    fieldnames = ["task", "run_01", "run_02", "run_03", "run_04", "run_05"]
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    for task in tasks:
+        row = {"task": task}
+        for run_idx in range(1, n_runs + 1):
+            row[f"run_{run_idx:02d}"] = all_runs[run_idx][task]
+        writer.writerow(row)
+
+summary_rows = []
+for task in tasks:
+    values = [all_runs[run_idx][task] for run_idx in range(1, n_runs + 1)]
+    summary_rows.append(
+        {
+            "task": task,
+            "run_01": values[0],
+            "run_02": values[1],
+            "run_03": values[2],
+            "run_04": values[3],
+            "run_05": values[4],
+            "mean_success_rate": statistics.mean(values),
+            "std_success_rate": statistics.stdev(values),
+        }
+    )
+
+with open(summary_csv, "w", newline="") as f:
+    fieldnames = [
+        "task",
+        "run_01",
+        "run_02",
+        "run_03",
+        "run_04",
+        "run_05",
+        "mean_success_rate",
+        "std_success_rate",
+    ]
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(summary_rows)
+
+run_avgs = {
+    run_idx: statistics.mean(all_runs[run_idx][task] for task in tasks)
+    for run_idx in range(1, n_runs + 1)
+}
+
+overall_avg_sr = statistics.mean(row["mean_success_rate"] for row in summary_rows)
+
+header = (
+    f"{'Task':38s} "
+    f"{'R1':>6s} "
+    f"{'R2':>6s} "
+    f"{'R3':>6s} "
+    f"{'R4':>6s} "
+    f"{'R5':>6s} "
+    f"{'Mean +/- Std':>18s}"
+)
+
+lines = [header, "-" * len(header)]
+for row in summary_rows:
+    lines.append(
+        f"{row['task']:38s} "
+        f"{row['run_01']:6.1f} "
+        f"{row['run_02']:6.1f} "
+        f"{row['run_03']:6.1f} "
+        f"{row['run_04']:6.1f} "
+        f"{row['run_05']:6.1f} "
+        f"{row['mean_success_rate']:6.1f} +/- {row['std_success_rate']:.1f}"
+    )
+
+lines.append("-" * len(header))
+for run_idx in range(1, n_runs + 1):
+    lines.append(f"Run {run_idx:02d} Avg. SR: {run_avgs[run_idx]:.2f}%")
+
+lines.append("")
+lines.append(f"TABLE-1 Avg. SR (18-task mean): {overall_avg_sr:.2f}%")
+text = "\n".join(lines)
+
+print()
+print(text)
+print()
+
+with open(summary_txt, "w") as f:
+    f.write(text)
+    f.write("\n")
+
+print("Saved:")
+print(" ", per_run_csv)
+print(" ", summary_csv)
+print(" ", summary_txt)
 PY
 }
 
@@ -509,7 +724,11 @@ validate_node_environment() {
         return 2
     fi
 
-    validate_pmf_parameters || return 2
+    if [[ "$PMF_ENABLED" == "1" ]]; then
+        validate_pmf_parameters || return 2
+    else
+        echo "PMF: disabled"
+    fi
     parse_gpu_spec "$gpu_spec" || return 2
     validate_eval_data || return 2
     hf_offline_preflight || return 2
@@ -616,11 +835,20 @@ run_one_repetition() {
     local local_rep_dir
     local xvfb_bin_dir
     local rc
+    local -a pmf_args=()
 
     rep_name="$(printf 'run_%02d' "$rep")"
     shared_rep_dir="$RUN_ROOT/$rep_name"
     local_rep_dir="$LOCAL_RUN_ROOT/$rep_name"
     xvfb_bin_dir="$(dirname "$XVFB_RUN")"
+
+    if [[ "$PMF_ENABLED" == "1" ]]; then
+        pmf_args+=(
+            --pmf-enabled
+            --pmf-prior-var "$PMF_PRIOR_VAR"
+            --pmf-observation-var "$PMF_OBSERVATION_VAR"
+        )
+    fi
 
     mkdir -p "$shared_rep_dir"
 
@@ -638,6 +866,7 @@ run_one_repetition() {
         echo "transformers_offline=$TRANSFORMERS_OFFLINE"
         echo "conda_python=$CONDA_PREFIX/bin/python"
         echo "gl_preload=${NODE_GL_PRELOAD:-<none>}"
+        echo "pmf_enabled=$PMF_ENABLED"
     } > "$shared_rep_dir/meta.txt"
 
     log "START $rep_name on physical GPU $gpu"
@@ -680,9 +909,7 @@ run_one_repetition() {
                 --log-name "$RUN_NAME/$rep_name" \
                 --device 0 \
                 --headless \
-                --pmf-enabled \
-                --pmf-prior-var "$PMF_PRIOR_VAR" \
-                --pmf-observation-var "$PMF_OBSERVATION_VAR"
+                "${pmf_args[@]}"
 
     ) > "$shared_rep_dir/stdout.log" 2>&1
 
@@ -858,6 +1085,34 @@ if [[ "$SCRIPT_MODE" != "controller" ]]; then
     exit 2
 fi
 
+if [[ "$AGGREGATE_ONLY" == "1" ]]; then
+    if [[ -z "$EXISTING_RUN_ROOT" ]]; then
+        echo "ERROR: EXISTING_RUN_ROOT is required when AGGREGATE_ONLY=1"
+        exit 2
+    fi
+
+    if [[ ! -d "$EXISTING_RUN_ROOT" ]]; then
+        echo "ERROR: EXISTING_RUN_ROOT does not exist: $EXISTING_RUN_ROOT"
+        exit 2
+    fi
+
+    missing_results=0
+    for ((rep = 1; rep <= N_REPEATS; rep++)); do
+        result_csv="$EXISTING_RUN_ROOT/$(printf 'run_%02d' "$rep")/$MODEL_STEM/eval_results.csv"
+        if [[ ! -f "$result_csv" ]]; then
+            echo "ERROR: missing aggregation input: $result_csv"
+            missing_results=1
+        fi
+    done
+
+    if (( missing_results != 0 )); then
+        exit 2
+    fi
+
+    aggregate_results "$EXISTING_RUN_ROOT"
+    exit $?
+fi
+
 ###############################################################################
 # Controller GPU selection
 ###############################################################################
@@ -927,7 +1182,7 @@ for ((rep = 1; rep <= N_REPEATS; rep++)); do
 done
 
 {
-    echo "BridgeVLA + PMF RLBench Table-1 three-node stable GLVND evaluation"
+    echo "$EVALUATION_VARIANT RLBench Table-1 three-node stable GLVND evaluation"
     echo
     echo "date=$(date)"
     echo "controller_hostname=$(hostname)"
@@ -941,7 +1196,7 @@ done
     echo "eval_episodes=$EVAL_EPISODES"
     echo "start_episode=$START_EPISODE"
     echo "episode_length=$EPISODE_LENGTH"
-    echo "pmf_enabled=true"
+    echo "pmf_enabled=$PMF_ENABLED_TEXT"
     echo "pmf_prior_var=$PMF_PRIOR_VAR"
     echo "pmf_observation_var=$PMF_OBSERVATION_VAR"
     echo "hf_hub_offline=1"
@@ -978,7 +1233,7 @@ fi
 
 echo
 echo "============================================================"
-echo "BridgeVLA + PMF RLBench Table-1 three-node stable GLVND evaluation"
+echo "$EVALUATION_VARIANT RLBench Table-1 three-node stable GLVND evaluation"
 echo "============================================================"
 echo "Shared run root : $RUN_ROOT"
 echo "Model           : $MODEL_NAME"
@@ -987,6 +1242,7 @@ echo "Episodes/task   : 25"
 echo "Steps/episode   : 25 max"
 echo "Repetitions     : 5"
 echo "Total trials    : 2250"
+echo "PMF enabled     : $PMF_ENABLED_LABEL"
 echo "PMF prior var   : $PMF_PRIOR_VAR"
 echo "PMF obs var     : $PMF_OBSERVATION_VAR"
 echo "HF mode         : strict offline"
@@ -1144,6 +1400,7 @@ launch_remote_group() {
     remote_cmd+="NODE_HF_HUB_CACHE=$(shell_quote "$data_root/huggingface_cache/hub") "
     remote_cmd+="XVFB_RUN=$(shell_quote "$xvfb_run") "
     remote_cmd+="NODE_GL_PRELOAD=$(shell_quote "$gl_preload") "
+    remote_cmd+="PMF_ENABLED=$(shell_quote "$PMF_ENABLED") "
     remote_cmd+="PMF_PRIOR_VAR=$(shell_quote "$PMF_PRIOR_VAR") "
     remote_cmd+="PMF_OBSERVATION_VAR=$(shell_quote "$PMF_OBSERVATION_VAR") "
     remote_cmd+="CPU_THREADS=$(shell_quote "$CPU_THREADS") "
@@ -1297,186 +1554,7 @@ done
 # Aggregate the 5 complete repetitions
 ###############################################################################
 
-echo
-echo "============================================================"
-echo "Aggregating Table-1 statistics"
-echo "============================================================"
-
-"$CONDA_PREFIX/bin/python" - "$RUN_ROOT" "$MODEL_STEM" <<'PY'
-import csv
-import os
-import statistics
-import sys
-
-run_root = sys.argv[1]
-model_stem = sys.argv[2]
-
-tasks = [
-    "close_jar",
-    "reach_and_drag",
-    "insert_onto_square_peg",
-    "meat_off_grill",
-    "open_drawer",
-    "place_cups",
-    "place_wine_at_rack_location",
-    "push_buttons",
-    "put_groceries_in_cupboard",
-    "put_item_in_drawer",
-    "put_money_in_safe",
-    "light_bulb_in",
-    "slide_block_to_color_target",
-    "place_shape_in_shape_sorter",
-    "stack_blocks",
-    "stack_cups",
-    "sweep_to_dustpan_of_size",
-    "turn_tap",
-]
-
-n_runs = 5
-all_runs = {}
-errors = []
-
-for run_idx in range(1, n_runs + 1):
-    run_name = f"run_{run_idx:02d}"
-    csv_path = os.path.join(run_root, run_name, model_stem, "eval_results.csv")
-
-    if not os.path.isfile(csv_path):
-        errors.append(f"{run_name}: missing {csv_path}")
-        continue
-
-    run_results = {}
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            task = (row.get("task") or "").strip()
-            value = (row.get("success rate") or "").strip()
-            if not task:
-                continue
-            if task in run_results:
-                errors.append(f"{run_name}: duplicate task {task}")
-                continue
-            try:
-                value = float(value)
-            except ValueError:
-                errors.append(f"{run_name}: invalid success rate for {task}: {value!r}")
-                continue
-            run_results[task] = value
-
-    missing = [t for t in tasks if t not in run_results]
-    extra = [t for t in run_results if t not in tasks]
-    if missing:
-        errors.append(f"{run_name}: missing tasks: {', '.join(missing)}")
-    if extra:
-        errors.append(f"{run_name}: unexpected tasks: {', '.join(extra)}")
-    if not missing and not extra:
-        all_runs[run_idx] = run_results
-
-if errors:
-    print()
-    print("Aggregation errors:")
-    for e in errors:
-        print("  -", e)
-    print()
-
-if len(all_runs) != n_runs:
-    print(f"ERROR: only {len(all_runs)}/{n_runs} complete repetitions are available.")
-    sys.exit(2)
-
-per_run_csv = os.path.join(run_root, "table1_per_run.csv")
-summary_csv = os.path.join(run_root, "table1_summary.csv")
-summary_txt = os.path.join(run_root, "table1_summary.txt")
-
-with open(per_run_csv, "w", newline="") as f:
-    fieldnames = ["task", "run_01", "run_02", "run_03", "run_04", "run_05"]
-    writer = csv.DictWriter(f, fieldnames=fieldnames)
-    writer.writeheader()
-    for task in tasks:
-        row = {"task": task}
-        for run_idx in range(1, n_runs + 1):
-            row[f"run_{run_idx:02d}"] = all_runs[run_idx][task]
-        writer.writerow(row)
-
-summary_rows = []
-for task in tasks:
-    values = [all_runs[run_idx][task] for run_idx in range(1, n_runs + 1)]
-    summary_rows.append(
-        {
-            "task": task,
-            "run_01": values[0],
-            "run_02": values[1],
-            "run_03": values[2],
-            "run_04": values[3],
-            "run_05": values[4],
-            "mean_success_rate": statistics.mean(values),
-            "std_success_rate": statistics.stdev(values),
-        }
-    )
-
-with open(summary_csv, "w", newline="") as f:
-    fieldnames = [
-        "task",
-        "run_01",
-        "run_02",
-        "run_03",
-        "run_04",
-        "run_05",
-        "mean_success_rate",
-        "std_success_rate",
-    ]
-    writer = csv.DictWriter(f, fieldnames=fieldnames)
-    writer.writeheader()
-    writer.writerows(summary_rows)
-
-run_avgs = {
-    run_idx: statistics.mean(all_runs[run_idx][task] for task in tasks)
-    for run_idx in range(1, n_runs + 1)
-}
-
-overall_avg_sr = statistics.mean(row["mean_success_rate"] for row in summary_rows)
-
-header = (
-    f"{'Task':38s} "
-    f"{'R1':>6s} "
-    f"{'R2':>6s} "
-    f"{'R3':>6s} "
-    f"{'R4':>6s} "
-    f"{'R5':>6s} "
-    f"{'Mean +/- Std':>18s}"
-)
-
-lines = [header, "-" * len(header)]
-for row in summary_rows:
-    lines.append(
-        f"{row['task']:38s} "
-        f"{row['run_01']:6.1f} "
-        f"{row['run_02']:6.1f} "
-        f"{row['run_03']:6.1f} "
-        f"{row['run_04']:6.1f} "
-        f"{row['run_05']:6.1f} "
-        f"{row['mean_success_rate']:6.1f} +/- {row['std_success_rate']:.1f}"
-    )
-
-lines.append("-" * len(header))
-for run_idx in range(1, n_runs + 1):
-    lines.append(f"Run {run_idx:02d} Avg. SR: {run_avgs[run_idx]:.2f}%")
-
-lines.append("")
-lines.append(f"TABLE-1 Avg. SR (18-task mean): {overall_avg_sr:.2f}%")
-text = "\n".join(lines)
-
-print()
-print(text)
-print()
-
-with open(summary_txt, "w") as f:
-    f.write(text)
-    f.write("\n")
-
-print("Saved:")
-print(" ", per_run_csv)
-print(" ", summary_csv)
-print(" ", summary_txt)
-PY
+aggregate_results "$RUN_ROOT"
 
 SUMMARY_RC=$?
 
@@ -1504,7 +1582,7 @@ if (( SUMMARY_RC != 0 )); then
 fi
 
 echo "============================================================"
-echo "SUCCESS: BridgeVLA + PMF Table-1 three-node evaluation finished."
+echo "SUCCESS: $EVALUATION_VARIANT Table-1 three-node evaluation finished."
 echo
 echo "Shared results:"
 echo "  $RUN_ROOT/table1_per_run.csv"
