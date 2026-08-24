@@ -8,6 +8,9 @@ dist/
 # ===== Local env bootstrap (machine-specific paths) =====
 env.sh
 
+# ===== Agent-local scratch workspace =====
+/agent_playground/
+
 # ===== Data & weights (user-provided, huge) =====
 data/
 data/*/
