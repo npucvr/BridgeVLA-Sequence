@@ -14,7 +14,7 @@ fi
 
 EXPECTED_ENV="bridgevla_rlbench"
 EXPECTED_BRANCH="lizhe/prob-motion-filter"
-REFERENCE_COMMIT="${REFERENCE_COMMIT:-a5b64dc132175f8517cdccc0570747c9da227749}"
+REFERENCE_COMMIT="${REFERENCE_COMMIT:-}"
 
 BRIDGEVLA_ROOT="${BRIDGEVLA_ROOT:-/remote_userdata/lizhe/VLA/BridgeVLA/BridgeVLA-Sequence}"
 MODEL_NAME="${MODEL_NAME:-model_80.pth}"
@@ -351,11 +351,17 @@ validate_node_environment() {
         echo "ERROR: wrong branch on $NODE_NAME: $CURRENT_BRANCH"
         return 2
     fi
-    if [[ "$CURRENT_COMMIT" != "$REFERENCE_COMMIT" ]]; then
-        echo "WARNING: current commit differs from diagnostics reference commit."
-        echo "Reference: $REFERENCE_COMMIT"
-        echo "Current  : $CURRENT_COMMIT"
+    if [[ -z "$REFERENCE_COMMIT" ]]; then
+        echo "ERROR: REFERENCE_COMMIT is empty on $NODE_NAME."
+        return 2
     fi
+    if [[ "$CURRENT_COMMIT" != "$REFERENCE_COMMIT" ]]; then
+        echo "ERROR: git commit mismatch on $NODE_NAME."
+        echo "Expected: $REFERENCE_COMMIT"
+        echo "Current : $CURRENT_COMMIT"
+        return 2
+    fi
+    echo "Git commit preflight: OK ($CURRENT_COMMIT)"
     for config in "$EVAL_PY" "$ANALYZER_PY" "$MODEL_FOLDER/$MODEL_NAME" \
         "$MODEL_FOLDER/exp_cfg.yaml" "$MODEL_FOLDER/mvt_cfg.yaml"; do
         if [[ ! -f "$config" ]]; then
@@ -391,6 +397,7 @@ write_node_metadata() {
         echo "date=$(date)"
         echo "git_branch=${CURRENT_BRANCH:-}"
         echo "git_commit=${CURRENT_COMMIT:-}"
+        echo "reference_commit=$REFERENCE_COMMIT"
         echo "node_data_root=$NODE_DATA_ROOT"
         echo "model=$MODEL_FOLDER/$MODEL_NAME"
         echo "eval_data=$EVAL_DATA"
@@ -630,6 +637,27 @@ if [[ "$SCRIPT_MODE" != "controller" ]]; then
     exit 2
 fi
 
+CONTROLLER_BRANCH="$(git -C "$BRIDGEVLA_ROOT" branch --show-current 2>/dev/null || true)"
+CONTROLLER_COMMIT="$(git -C "$BRIDGEVLA_ROOT" rev-parse HEAD 2>/dev/null || true)"
+if [[ "$CONTROLLER_BRANCH" != "$EXPECTED_BRANCH" ]]; then
+    echo "ERROR: wrong branch on controller: $CONTROLLER_BRANCH"
+    exit 2
+fi
+if [[ -z "$CONTROLLER_COMMIT" ]]; then
+    echo "ERROR: unable to determine controller git commit."
+    exit 2
+fi
+if [[ -z "$REFERENCE_COMMIT" ]]; then
+    REFERENCE_COMMIT="$CONTROLLER_COMMIT"
+elif [[ "$CONTROLLER_COMMIT" != "$REFERENCE_COMMIT" ]]; then
+    echo "ERROR: controller commit does not match REFERENCE_COMMIT"
+    echo "Reference : $REFERENCE_COMMIT"
+    echo "Controller: $CONTROLLER_COMMIT"
+    exit 2
+fi
+CURRENT_BRANCH="$CONTROLLER_BRANCH"
+CURRENT_COMMIT="$CONTROLLER_COMMIT"
+
 LOCAL_GPU_SPEC="${LOCAL_GPUS:-}"
 SERVER112_GPU_SPEC="${SERVER112_GPUS:-}"
 SERVER108_GPU_SPEC="${SERVER108_GPUS:-}"
@@ -653,12 +681,6 @@ if [[ -n "$LOCAL_GPU_SPEC" ]]; then
 else
     if [[ "${CONDA_DEFAULT_ENV:-}" != "$EXPECTED_ENV" || ! -x "$CONDA_PREFIX/bin/python" ]]; then
         echo "ERROR: activate $EXPECTED_ENV first on controller."
-        exit 2
-    fi
-    CURRENT_BRANCH="$(git -C "$BRIDGEVLA_ROOT" branch --show-current 2>/dev/null || true)"
-    CURRENT_COMMIT="$(git -C "$BRIDGEVLA_ROOT" rev-parse HEAD 2>/dev/null || true)"
-    if [[ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]]; then
-        echo "ERROR: wrong branch on controller: $CURRENT_BRANCH"
         exit 2
     fi
     validate_pmf_parameters || exit 2
@@ -686,6 +708,8 @@ done
     echo "controller_hostname=$(hostname)"
     echo "git_branch=${CURRENT_BRANCH:-}"
     echo "git_commit=${CURRENT_COMMIT:-}"
+    echo "controller_commit=$CONTROLLER_COMMIT"
+    echo "reference_commit=$REFERENCE_COMMIT"
     echo "model_name=$MODEL_NAME"
     echo "diag_tasks=$DIAG_TASKS"
     echo "diag_modes=$DIAG_MODES"
@@ -711,6 +735,7 @@ echo "============================================================"
 echo "BridgeVLA PMF diagnostics three-node stable GLVND evaluation"
 echo "============================================================"
 echo "Shared run root : $RUN_ROOT"
+echo "Git commit       : $REFERENCE_COMMIT"
 echo "Number of tasks : ${#DIAG_TASK_ARRAY[@]}"
 echo "Number of modes : ${#DIAG_MODE_ARRAY[@]}"
 echo "Total jobs      : $TOTAL_JOBS"
@@ -810,6 +835,7 @@ launch_remote_group() {
     remote_cmd+="SCRIPT_MODE=worker WORKER_TAG=$(shell_quote "$tag") "
     remote_cmd+="WORKER_GPUS=$(shell_quote "$gpu_spec") RUN_NAME=$(shell_quote "$RUN_NAME") "
     remote_cmd+="SHARED_EVAL_ROOT=$(shell_quote "$SHARED_EVAL_ROOT") BRIDGEVLA_ROOT=$(shell_quote "$BRIDGEVLA_ROOT") "
+    remote_cmd+="REFERENCE_COMMIT=$(shell_quote "$REFERENCE_COMMIT") "
     remote_cmd+="MODEL_NAME=$(shell_quote "$MODEL_NAME") NODE_DATA_ROOT=$(shell_quote "$data_root") "
     remote_cmd+="MODEL_FOLDER=$(shell_quote "$data_root/VLA/BridgeVLA/checkpoints/bridgevla/rlbench") "
     remote_cmd+="EVAL_DATA=$(shell_quote "$data_root/VLA/BridgeVLA/datasets/rlbench/eval") "
