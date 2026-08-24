@@ -9,11 +9,13 @@ GPU_ID="${2:-0}"
 EVAL_EPISODES="${EVAL_EPISODES:-25}"
 EPISODE_LENGTH="${EPISODE_LENGTH:-25}"
 
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
-source "$REPO_ROOT/env.sh"
 set -euo pipefail
+: "${BRIDGEVLA_START_XVFB:=1}"
+export BRIDGEVLA_START_XVFB
+source "$REPO_ROOT/scripts/bridgevla_runtime.sh"
 
 cd "$REPO_ROOT/finetune/RLBench"
+echo "[runner] host=$(hostname -s 2>/dev/null || hostname) pwd=$(pwd) gpu=${GPU_ID}"
 
 MODEL_FOLDER="${MODEL_FOLDER:-$REPO_ROOT/data/bridgevla_ckpt/bridgevla/rlbench}"
 # The released TRAIN_DATA contains the 100 training demonstrations.  The

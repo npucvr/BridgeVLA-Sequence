@@ -2,6 +2,7 @@
 # Run the 5 RLBench eval repeats in parallel on GPU_IDS, then aggregate.
 # With fewer than five IDs, repeats are scheduled in waves (e.g. GPU_IDS=0,2).
 # DISPLAY_IDS can map those slots to isolated Xvfb displays (e.g. :1.0,:2.0).
+set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 LOG_DIR="${LOG_DIR:-/tmp/bridgevla_rlbench_parallel_logs}"
@@ -10,15 +11,18 @@ EVAL_DATAFOLDER="${EVAL_DATAFOLDER:-$REPO_ROOT/data/RLBench_EVAL_DATA}"
 RESULT_LOG_DIR="${RESULT_LOG_DIR:-rlbench_repro}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4}"
 DISPLAY_IDS="${DISPLAY_IDS:-}"
-PYTHON="${PYTHON:-/home/sunguodong/.conda/envs/bridgevla/bin/python}"
 export EVAL_DATAFOLDER MODEL_FOLDER RESULT_LOG_DIR GPU_IDS DISPLAY_IDS
+
+cd "$REPO_ROOT"
+source "$REPO_ROOT/scripts/bridgevla_runtime.sh"
+PYTHON="${PYTHON:-$(command -v python)}"
+export PYTHON
 
 mkdir -p "$LOG_DIR"
 : > "$LOG_DIR/status.txt"
 echo "[launcher] eval data: $EVAL_DATAFOLDER" | tee -a "$LOG_DIR/status.txt"
 
 # Fail early if the caller accidentally points at the 100-demo training split.
-source "$REPO_ROOT/env.sh" >/dev/null 2>&1
 if ! "$PYTHON" "$SCRIPT_DIR/verify_eval_data.py" \
     --data-folder "$EVAL_DATAFOLDER" --exact-episodes >> "$LOG_DIR/status.txt" 2>&1; then
   echo "[launcher] evaluation data verification failed" | tee -a "$LOG_DIR/status.txt"

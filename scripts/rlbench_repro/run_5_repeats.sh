@@ -1,17 +1,19 @@
 #!/bin/bash
 # Wait until eval data is ready and a GPU + enough CPU RAM are available,
 # then run the released model_80 checkpoint five times and aggregate.
+set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 LOG_FILE="${LOG_FILE:-/tmp/bridgevla_rlbench_repro_5runs.log}"
-PYTHON="${PYTHON:-/home/sunguodong/.conda/envs/bridgevla/bin/python}"
 EVAL_DATAFOLDER="${EVAL_DATAFOLDER:-$REPO_ROOT/data/RLBench_EVAL_DATA}"
 RESULT_LOG_DIR="${RESULT_LOG_DIR:-rlbench_repro}"
 export EVAL_DATAFOLDER RESULT_LOG_DIR
 MIN_CPU_AVAIL_MB="${MIN_CPU_AVAIL_MB:-51200}"
 
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
-source "$REPO_ROOT/env.sh" >/dev/null 2>&1
+cd "$REPO_ROOT"
+source "$REPO_ROOT/scripts/bridgevla_runtime.sh"
+PYTHON="${PYTHON:-$(command -v python)}"
+export PYTHON
 EXTRACT_LOG="${EXTRACT_LOG:-/tmp/bridgevla_extract_eval_data.log}"
 echo "[scheduler] eval data: $EVAL_DATAFOLDER" >> "$LOG_FILE"
 echo "[scheduler] start $(date)" >> "$LOG_FILE"
