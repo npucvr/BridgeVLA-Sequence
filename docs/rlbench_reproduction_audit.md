@@ -14,8 +14,9 @@ RLBench 评估协议复现 BridgeVLA baseline 结果。
 
 - [LPY/BridgeVLA_RLBench_EVAL_DATA](https://huggingface.co/datasets/LPY/BridgeVLA_RLBench_EVAL_DATA/tree/main)
 
-使用每个任务的 episodes `0..24`，共 18 个任务 × 25 个 episodes。评估脚本会在运行
-前检查任务数量和 episode 范围，避免使用错误的数据目录。
+使用每个任务的 episodes `0..24`，共 18 个任务 × 25 个 episodes。运行前需将数据准备为
+`task/all_variations/episodes/episode0..episode24` 的目录布局，并将
+`EVAL_DATAFOLDER` 指向该目录。
 
 ## 评估协议
 
@@ -42,30 +43,20 @@ RLBench 评估协议复现 BridgeVLA baseline 结果。
 
 ## 复现命令
 
-下载并准备官方 EVAL 数据后执行：
+下载并按上述目录布局准备官方 EVAL 数据后执行统一的五次评估入口：
 
 ```bash
-DATA_DIR=/PATH/TO/RLBench_EVAL_DATA \
-  bash scripts/rlbench_repro/extract_eval_data.sh
-
 EVAL_DATAFOLDER=/PATH/TO/RLBench_EVAL_DATA \
 RESULT_LOG_DIR=rlbench_eval_split \
-  bash scripts/rlbench_repro/run_5_parallel.sh
+  bash scripts/rlbench_repro/run_repeated_eval.sh
 ```
 
-并行运行时，每个 CoppeliaSim 实例需要独立的 display 和 GPU。例如：
+默认使用一张 GPU 顺序运行。并行运行时，每个 CoppeliaSim 实例需要独立的
+GPU 和 display，例如：
 
 ```bash
 GPU_IDS=0,2 DISPLAY_IDS=:1.0,:2.0 \
-  bash scripts/rlbench_repro/run_5_parallel.sh
-```
-
-如果只使用一张 GPU，可以运行顺序版本：
-
-```bash
-EVAL_DATAFOLDER=/PATH/TO/RLBench_EVAL_DATA \
-RESULT_LOG_DIR=rlbench_eval_split \
-  bash scripts/rlbench_repro/run_5_repeats.sh
+  bash scripts/rlbench_repro/run_repeated_eval.sh
 ```
 
 ## 环境说明
