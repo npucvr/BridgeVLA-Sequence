@@ -303,12 +303,13 @@ def eval(
                 if "eval" in s.name:
                     s.name = "%s/%s" % (s.name, task_name)
 
-        if len(summaries) > 0:
-            task_score = [
-                s.value for s in summaries if f"eval_envs/return/{task_name}" in s.name
-            ][0]
+        # Use the episode rewards for the scalar task score. The summary names
+        # are rewritten above for CSV/TensorBoard, so matching the original
+        # accumulator name is brittle and can yield a non-numeric "unknown".
+        if task_rewards:
+            task_score = float(np.mean([float(reward) for reward in task_rewards]))
         else:
-            task_score = "unknown"
+            task_score = 0.0
 
         print(f"[Evaluation] Finished {task_name} | Final Score: {task_score}\n")
 
@@ -401,6 +402,8 @@ def _eval(args):
     tb = TensorboardManager(args.eval_log_dir)
     for model_path in model_paths:
         tasks_to_eval = deepcopy(args.tasks)
+        if tasks_to_eval == ["all"]:
+            tasks_to_eval = list(RLBENCH_TASKS)
         model_idx = get_model_index(model_path)
         if model_idx is None:
             model_idx = 0
