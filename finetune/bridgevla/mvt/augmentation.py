@@ -2,11 +2,59 @@
 import numpy as np
 import torch
 import bridgevla.mvt.aug_utils as aug_utils
-from pytorch3d import transforms as torch3d_tf
+
 from scipy.spatial.transform import Rotation
-import torch
-import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+try:
+    from pytorch3d import transforms as torch3d_tf
+except ImportError:
+    class _ScipyTransformsFallback:
+        """Small CPU fallback for environments without PyTorch3D.
+
+        SE(3) augmentation is already executed under ``torch.no_grad`` and
+        converts perturbed poses to NumPy below, so this fallback preserves
+        the augmentation semantics without adding a hard import dependency.
+        """
+
+        @staticmethod
+        def _numpy(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().numpy()
+            return np.asarray(value)
+
+        @classmethod
+        def quaternion_to_matrix(cls, quaternion_wxyz):
+            quaternion_xyzw = cls._numpy(quaternion_wxyz)[..., [1, 2, 3, 0]]
+            matrix = R.from_quat(quaternion_xyzw).as_matrix()
+            return torch.as_tensor(
+                matrix,
+                device=quaternion_wxyz.device,
+                dtype=quaternion_wxyz.dtype,
+            )
+
+        @classmethod
+        def euler_angles_to_matrix(cls, angles, convention):
+            matrix = R.from_euler(
+                convention.lower(), cls._numpy(angles)
+            ).as_matrix()
+            if isinstance(angles, torch.Tensor):
+                return torch.as_tensor(
+                    matrix, device=angles.device, dtype=angles.dtype
+                )
+            return torch.as_tensor(matrix)
+
+        @classmethod
+        def matrix_to_quaternion(cls, matrix):
+            quaternion_xyzw = R.from_matrix(cls._numpy(matrix)).as_quat()
+            quaternion_wxyz = quaternion_xyzw[..., [3, 0, 1, 2]]
+            return torch.as_tensor(
+                quaternion_wxyz,
+                device=matrix.device,
+                dtype=matrix.dtype,
+            )
+
+    torch3d_tf = _ScipyTransformsFallback()
 
 def perturb_se3(pcd, trans_shift_4x4, rot_shift_4x4, action_gripper_4x4, bounds):
     """Perturb point clouds with given transformation.
@@ -141,7 +189,6 @@ def apply_se3_augmentation(
     :param device: torch device
     :return: perturbed action_trans, action_rot_grip, pcd
     """
-
     # batch size
     bs = pcd[0].shape[0]
 
@@ -279,7 +326,6 @@ def apply_se3_aug_con(
     :param single_scale: whether we preserve the relative dimensions
     :return: perturbed action_gripper_pose,  pcd
     """
-
     # batch size
     bs = pcd.shape[0]
     device = pcd.device
