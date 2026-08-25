@@ -29,6 +29,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..."))
 import RLBench.utils.peract_utils_rlbench as rlbench_utils
 import GemBench.utils.peract_utils_gembench as gembench_utils
 import bridgevla.mvt.utils as mvt_utils
+from bridgevla.mvt.stage1_token_cache import Stage1KeypointTokenCache
 import bridgevla.utils.rvt_utils as rvt_utils
 from bridgevla.mvt.augmentation import apply_se3_aug_con, aug_utils
 from yarr.agents.agent import ActResult
@@ -415,6 +416,8 @@ class RVTAgent:
         rot_ver: int = 0,
         rot_x_y_aug: int = 2,
         log_dir="",
+        stage1_token_cache_dir=None,
+        stage1_adapter_only=False,
     ):
         self._network = network
         self._num_rotation_classes = num_rotation_classes
@@ -439,6 +442,7 @@ class RVTAgent:
         self.log_dir = log_dir
         self.scene_bounds = scene_bounds
         self.cameras = cameras
+        self._stage1_adapter_only = stage1_adapter_only
 
         print("Cameras:",self.cameras)
         self.move_pc_in_bound = move_pc_in_bound
@@ -450,6 +454,18 @@ class RVTAgent:
             self._net_mod = self._network.module
         else:
             self._net_mod = self._network
+
+        if stage1_token_cache_dir is None:
+            self._stage1_token_cache = None
+        else:
+            self._stage1_token_cache = Stage1KeypointTokenCache(
+                stage1_token_cache_dir,
+                max_history=self._net_mod.mvt1.stage1_history_len,
+            )
+
+        # Online evaluation keeps a causal window of the preceding control
+        # observations. Training uses the replay keyframe cache instead.
+        self._stage1_eval_history_tokens = []
 
         self.num_all_rot = self._num_rotation_classes * 3
 
@@ -603,6 +619,24 @@ class RVTAgent:
         tasks = replay_sample["tasks"]
         return_out = {}
 
+        stage1_history_tokens = None
+        stage1_history_mask = None
+        if self._stage1_token_cache is not None:
+            if self._net_mod.mvt1.stage1_history_len <= 1:
+                raise ValueError(
+                    "A Stage-1 token cache is only needed when history_len > 1"
+                )
+            stage1_history_tokens, stage1_history_mask = (
+                self._stage1_token_cache.get_batch(
+                    tasks,
+                    replay_sample["episode_idx"],
+                    replay_sample["keypoint_idx"],
+                    replay_sample.get("sample_frame"),
+                )
+            )
+            stage1_history_tokens = stage1_history_tokens.to(self._device)
+            stage1_history_mask = stage1_history_mask.to(self._device)
+
         obs, pcd = rlbench_utils._preprocess_inputs(replay_sample, self.cameras)
         
         with torch.no_grad():
@@ -702,7 +736,9 @@ class RVTAgent:
             img_aug=img_aug,
             wpt_local=wpt_local if self._network.training else None,
             rot_x_y=rot_x_y if self.rot_ver == 1 else None,
-            language_goal=replay_sample["lang_goal"]  
+            language_goal=replay_sample["lang_goal"],
+            stage1_history_tokens=stage1_history_tokens,
+            stage1_history_mask=stage1_history_mask,
         )
         
         q_trans, rot_q, grip_q, collision_q, y_q, pts = self.get_q(
@@ -807,6 +843,8 @@ class RVTAgent:
 
         action_grip = action_gripper_pose[:, -1].int()   # (b,)
         return_out = {}
+        stage1_history_tokens = None
+        stage1_history_mask = None
 
         obs, pcd = gembench_utils._preprocess_inputs_gembench(replay_sample, cameras)
         
@@ -914,7 +952,9 @@ class RVTAgent:
             img_aug=img_aug,
             wpt_local=wpt_local if self._network.training else None,
             rot_x_y=rot_x_y if self.rot_ver == 1 else None,
-            language_goal=replay_sample["lang_goal"]  
+            language_goal=replay_sample["lang_goal"],
+            stage1_history_tokens=stage1_history_tokens,
+            stage1_history_mask=stage1_history_mask,
         )
         
         q_trans, rot_q, grip_q, collision_q, y_q, pts = self.get_q(
@@ -1027,12 +1067,61 @@ class RVTAgent:
         nc = self._net_mod.num_img
         h = w = self._net_mod.img_size
         dyn_cam_info = None
+
+        # In online evaluation, each previous control observation is causal
+        # history. Pad the beginning of an episode so the current token always
+        # occupies the newest Stage-1 window position, matching training.
+        stage1_history_tokens = None
+        stage1_history_mask = None
+        return_stage1_tokens = False
+        stage1_history_len = int(
+            getattr(self._net_mod.mvt1, "stage1_history_len", 1)
+        )
+        if stage1_history_len > 1:
+            history_slots = stage1_history_len - 1
+            token_sequence = self._net_mod.mvt1.num_img * 256
+            token_dim = self._net_mod.mvt1.vlm_dim
+            token_dtype = next(self._net_mod.mvt1.model.parameters()).dtype
+            token_device = pc[0].device
+            stage1_history_tokens = torch.zeros(
+                bs,
+                history_slots,
+                token_sequence,
+                token_dim,
+                device=token_device,
+                dtype=token_dtype,
+            )
+            stage1_history_mask = torch.zeros(
+                bs, history_slots, dtype=torch.bool, device=token_device
+            )
+            previous = self._stage1_eval_history_tokens[-history_slots:]
+            if previous:
+                start = history_slots - len(previous)
+                stage1_history_tokens[:, start:] = torch.stack(
+                    [
+                        token.to(device=token_device, dtype=token_dtype)
+                        for token in previous
+                    ],
+                    dim=1,
+                )
+                stage1_history_mask[:, start:] = True
+            return_stage1_tokens = True
+
         out = self._network(
             pc=pc,
             img_feat=img_feat,
             img_aug=0,  # no img augmentation while acting
             language_goal=language_goal,
+            stage1_history_tokens=stage1_history_tokens,
+            stage1_history_mask=stage1_history_mask,
+            return_stage1_tokens=return_stage1_tokens,
         )
+        if return_stage1_tokens:
+            current_tokens = out.get("stage1_tokens")
+            if current_tokens is None:
+                raise RuntimeError("MVT did not return online Stage-1 tokens")
+            self._stage1_eval_history_tokens.append(current_tokens.detach())
+            del self._stage1_eval_history_tokens[:-history_slots]
         if visualize:
             q_trans, rot_q, grip_q, collision_q, y_q, _ = self.get_q(
                 out, dims=(bs, nc, h, w), only_pred=True, get_q_trans=True
@@ -1183,10 +1272,15 @@ class RVTAgent:
 
 
     def reset(self):
-        pass
+        self._stage1_eval_history_tokens.clear()
 
     def eval(self):
         self._network.eval()
 
     def train(self):
         self._network.train()
+        if self._stage1_adapter_only:
+            for name, module in self._net_mod.mvt1.named_children():
+                if name != "stage1_token_adapter":
+                    module.eval()
+            self._net_mod.mvt1.stage1_token_adapter.train()

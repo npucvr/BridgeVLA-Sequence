@@ -110,6 +110,8 @@ _bridgevla_python_paths=(
     "$BRIDGEVLA_ROOT/finetune/bridgevla/libs/YARR"
     "$BRIDGEVLA_ROOT/finetune/bridgevla/libs/RLBench"
     "$BRIDGEVLA_ROOT/finetune/bridgevla/libs/PyRep"
+    "$BRIDGEVLA_ROOT/finetune/bridgevla/libs/peract_colab"
+    "$BRIDGEVLA_ROOT/finetune/bridgevla/libs/point-renderer"
 )
 for _path in "${_bridgevla_python_paths[@]}"; do
     case ":${PYTHONPATH:-}:" in

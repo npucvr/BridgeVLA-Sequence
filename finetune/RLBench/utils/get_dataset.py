@@ -18,6 +18,20 @@ from peract_utils_rlbench import (
 from yarr.replay_buffer.wrappers.pytorch_replay_buffer import PyTorchReplayBuffer
 
 
+def _resolve_episode_root(data_folder, split, task):
+    """Resolve both official ``train/task`` and local task-root layouts."""
+    candidates = [
+        os.path.join(data_folder, split, task, "all_variations", "episodes"),
+        os.path.join(data_folder, task, "all_variations", "episodes"),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "RLBench episode directory not found; tried: " + ", ".join(candidates)
+    )
+
+
 def get_dataset(
     tasks,
     BATCH_SIZE_TRAIN,
@@ -32,6 +46,7 @@ def get_dataset(
     num_workers,
     only_train,
     sample_distribution_mode="transition_uniform",
+    clip_cache_dir=None,
 ):
 
     train_replay_buffer = create_replay(
@@ -52,7 +67,12 @@ def get_dataset(
 
     # load pre-trained language model
     try:
-        clip_model, _ = clip.load("RN50", device="cpu")  # CLIP-ResNet50
+        clip_load_kwargs = {}
+        if clip_cache_dir is not None:
+            clip_load_kwargs["download_root"] = clip_cache_dir
+        clip_model, _ = clip.load(
+            "RN50", device="cpu", **clip_load_kwargs
+        )  # CLIP-ResNet50
         clip_model = clip_model.to(device)
         clip_model.eval()
     except RuntimeError:
@@ -63,11 +83,12 @@ def get_dataset(
     for task in tasks:  # for each task
         # print("---- Preparing the data for {} task ----".format(task), flush=True)
         
-        EPISODES_FOLDER_TRAIN = f"train/{task}/all_variations/episodes"
-        EPISODES_FOLDER_VAL = f"val/{task}/all_variations/episodes"
-      
-        data_path_train = os.path.join(DATA_FOLDER, EPISODES_FOLDER_TRAIN)
-        data_path_val = os.path.join(DATA_FOLDER, EPISODES_FOLDER_VAL)
+        data_path_train = _resolve_episode_root(DATA_FOLDER, "train", task)
+        data_path_val = (
+            _resolve_episode_root(DATA_FOLDER, "val", task)
+            if not only_train
+            else None
+        )
         train_replay_storage_folder = f"{TRAIN_REPLAY_STORAGE_DIR}/{task}"
         test_replay_storage_folder = f"{TEST_REPLAY_STORAGE_DIR}/{task}"
 

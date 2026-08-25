@@ -31,6 +31,9 @@ _C.st_sca = 4
 _C.st_wpt_loc_aug = 0.05
 _C.st_wpt_loc_inp_no_noise = False
 _C.img_aug_2 = 0.0
+_C.paligemma_path = ""
+_C.stage1_history_len = 1
+_C.stage1_adapter_bottleneck = 128
 
 
 def get_cfg_defaults():

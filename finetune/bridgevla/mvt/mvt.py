@@ -62,6 +62,9 @@ class MVT(nn.Module):
         renderer_device,
         load_pretrain=False,
         pretrain_path=None,
+        paligemma_path="",
+        stage1_history_len=1,
+        stage1_adapter_bottleneck=128,
     ):
         super().__init__()
 
@@ -342,8 +345,22 @@ class MVT(nn.Module):
             wpt_local_stage_one = wpt_local_stage_one.clone().detach()
         else:
             wpt_local_stage_one = wpt_local
-        
-   
+
+        # Historical tokens are a Stage-1 input. The second-stage crop is a
+        # new view, so it must keep the original current-token path.
+        stage1_kwarg_names = {
+            "stage1_history_tokens",
+            "stage1_history_mask",
+            "stage1_token_window",
+            "stage1_token_mask",
+            "return_stage1_tokens",
+        }
+        mvt2_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in stage1_kwarg_names
+        }
+
         out = self.mvt1(
             img=img,
             wpt_local=wpt_local_stage_one,
@@ -441,7 +458,7 @@ class MVT(nn.Module):
                 rot_x_y=rot_x_y,
                 language_goal=language_goal,
                 forward_no_feat=False,
-                **kwargs,
+                **mvt2_kwargs,
             )
 
             out["wpt_local1"] = wpt_local_stage_one_noisy

@@ -70,6 +70,13 @@ t=1: [PAD, PAD, h0,  h1]
 
 任务结束时只使用已有的最近窗口；不能跨 episode 复用 tokens。
 
+Replay 的当前输入由 `sample_frame` 标识，因此历史 cache 只选择
+`keypoint_frame < sample_frame` 的关键帧；当当前输入本身就是一个关键帧时，不会把同一
+帧重复放进 history。`keypoint_idx` 仅用于校验目标动作的 episode 位置。Stage-2 crop
+会重新走当前 PaliGemma token 路径，不复用对应原始视图的 Stage-1 history。
+在线 EVAL 时由 `RVTAgent.reset()` 清空窗口，并将前序 control observation 的 Stage-1 token
+按同样的因果顺序缓存；训练仍使用 replay 的 keyframe cache。
+
 ## 数据实现
 
 当前 replay 使用 `timesteps=1`，不能直接提供历史窗口。第一版应从原始 RLBench
@@ -83,8 +90,67 @@ episode 的 `low_dim_obs.pkl` 和图像中生成关键帧窗口：
     -> 使用当前关键帧动作作为监督
 ```
 
-由于 PaliGemma 冻结，建议先离线缓存每个关键帧的 Stage-1 tokens，训练时只读取缓存，
-避免重复运行 PaliGemma。
+由于 PaliGemma 冻结，先离线缓存每个关键帧的 Stage-1 tokens，训练时只读取缓存，
+避免重复运行 PaliGemma。缓存脚本为
+[`precompute_stage1_tokens.py`](../scripts/rlbench_train/precompute_stage1_tokens.py)，
+每个文件保存一个 episode 的 `keypoint_frames` 和 `[N_keypoint, 768, 2048]`
+tokens。`--data_root` 同时支持 `task/all_variations/episodes` 和官方的
+`train/task/all_variations/episodes` 两种布局：
+
+```bash
+source scripts/bridgevla_runtime.sh
+python scripts/rlbench_train/precompute_stage1_tokens.py \
+  --data_root data/RLBench_TRAIN_DATA \
+  --output_root data/stage1_token_cache_k4 \
+  --checkpoint data/bridgevla_ckpt/bridgevla/rlbench/model_80.pth \
+  --paligemma_path data/bridgevla_ckpt/paligemma-3b-pt-224 \
+  --device cuda:0
+```
+
+K=4 训练入口需要 `--stage1_adapter_only`、`--init_checkpoint`、
+`--stage1_token_cache_dir`，并通过 `--mvt_cfg_opts
+"stage1_history_len 4"` 设置窗口长度；K=1 对照将 `stage1_history_len` 设为 1
+并省略 cache 参数。训练入口同时支持 `--data_folder` 指向
+`task/all_variations/episodes` 布局和 `--clip_cache_dir`。正式训练可使用：
+
+建议先按固定 update budget 做阶段训练，而不是直接跑完整的 100 epoch。当前入口将
+`train_iter` 按 `bs` 换算为 optimizer updates，下面示例每组先处理 1,000 个 sample，
+即 bs=4 时约 250 updates（`epochs=1`、`train_iter=1000`）：
+
+```bash
+cd finetune/RLBench
+python train.py \
+  --epochs 1 --num_train 25 \
+  --data_folder ../../data/RLBench_TRAIN_DATA \
+  --clip_cache_dir ../../data/clip_cache \
+  --train_replay_storage_dir ../../data/replay_train_k4 \
+  --stage1_token_cache_dir ../../data/stage1_token_cache_k4 \
+  --init_checkpoint ../../data/bridgevla_ckpt/bridgevla/rlbench/model_80.pth \
+  --stage1_adapter_only \
+  --mvt_cfg_path ../bridgevla/mvt/configs/rvt2.yaml \
+  --mvt_cfg_opts "paligemma_path ../../data/bridgevla_ckpt/paligemma-3b-pt-224 stage1_history_len 4" \
+  --exp_cfg_opts "tasks all bs 4 train_iter 1000"
+```
+
+K=1 只需把 `stage1_history_len` 改为 `1` 并删除 cache 参数；两组应使用相同
+replay、训练步数和日志/评估设置。短训后先用 `eval.py --eval-episodes 3` 做每任务
+方向性比较，确认趋势后再扩展到每任务 25 episodes。
+
+对照定义要区分两种 K=1：发布的 `model_80.pth` 是官方无 adapter baseline；从该 checkpoint
+继续训练、但 `stage1_history_len=1` 的 K=1 是 adapter-only control，不能代替官方 baseline。
+论文 RLBench 结果使用 18 tasks、每任务 25 trials；最终比较应统一采用该协议。
+
+本次按五次 EVAL 协议完成统一比较；每次为 18 tasks × 25 episodes/task = 450
+episodes。以每次 18-task 平均成功率计算，结果为：官方 `model_80.pth`
+`88.40 ± 0.84%`，K=1 adapter-only control `86.40 ± 1.27%`，K=4
+`88.04 ± 0.62%`（± 为五次运行间的 sample std）。论文 Table 1 的 BridgeVLA
+平均成功率为 88.2%；因此官方 checkpoint 为 `+0.20` 个百分点，K=1 control 为
+`-1.80` 个百分点，K=4 为 `-0.16` 个百分点；K=4 比 K=1 高 `+1.64` 个百分点。
+论文正文明确写明 RLBench 的 BridgeVLA 结果总共评估五次；仓库的
+`run_repeated_eval.sh` 是对同一个发布的 `model_80.pth` checkpoint 做五次 EVAL，再由
+`aggregate_runs.py` 计算 mean/std，并不是五个训练 checkpoint。
+当前 `eval.py` 将 `ep` 直接作为 `from_episode_number`；五次运行使用同一 held-out
+episode 编号，但由独立评估进程收集重复结果，不涉及重新训练五个模型。
 
 实际 EVAL 数据中关键帧数量中位数约为 5；K=4 是短期历史实验，不追求完整任务记忆。
 

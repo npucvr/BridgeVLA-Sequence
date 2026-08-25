@@ -16,6 +16,8 @@ Therefore, the code is also under the NVIDIA Source Code License
 Author: Peiyan Li
 Email: peiyan.li@cripac.ia.ac.cn
 '''
+import os
+
 import torch
 from torch import nn
 from einops import rearrange
@@ -24,6 +26,7 @@ from bridgevla.mvt.attn import (
     FixedPositionalEncoding,
 )
 from bridgevla.mvt.raft_utils import ConvexUpSample
+from bridgevla.mvt.stage1_token_adapter import Stage1TemporalTokenAdapter
 from PIL import Image
 
 
@@ -61,6 +64,9 @@ class MVT(nn.Module):
         no_feat=False,
         load_pretrain=False,
         pretrain_path=None,
+        paligemma_path="",
+        stage1_history_len=1,
+        stage1_adapter_bottleneck=128,
     ):
         super().__init__()
         self.depth = depth
@@ -123,7 +129,13 @@ class MVT(nn.Module):
 
 
         # Hardcoded for vlm
-        self.vlm_dim=2048  
+        self.vlm_dim = 2048
+        self.stage1_history_len = stage1_history_len
+        self.stage1_token_adapter = Stage1TemporalTokenAdapter(
+            token_dim=self.vlm_dim,
+            bottleneck_dim=stage1_adapter_bottleneck,
+            max_history=stage1_history_len,
+        )
 
         self.up0 = ConvexUpSample(
             in_dim=self.vlm_dim,
@@ -214,7 +226,11 @@ class MVT(nn.Module):
             return all_params
 
 
-        model_id = "google/paligemma-3b-pt-224"
+        model_id = (
+            paligemma_path
+            or os.environ.get("BRIDGEVLA_PALIGEMMA_PATH", "")
+            or "google/paligemma-3b-pt-224"
+        )
         if load_pretrain:
             assert pretrain_path is not None
 
@@ -287,6 +303,11 @@ class MVT(nn.Module):
         rot_x_y=None,
         language_goal=None,
         forward_no_feat=False,
+        stage1_history_tokens=None,
+        stage1_history_mask=None,
+        stage1_token_window=None,
+        stage1_token_mask=None,
+        return_stage1_tokens=False,
         **kwargs,
     ):
         """
@@ -298,48 +319,127 @@ class MVT(nn.Module):
         bs, num_img, img_feat_dim, h, w = img.shape
         assert num_img == self.num_img
         assert h == w == self.img_size
-        # only use rgb part
-        # print("input image feature shape:",img.shape)
-        img = img[:,:, 3:6, :, :] # bs,3,3,224,224
+        if stage1_token_window is None:
+            # Only the RGB channels are passed to PaliGemma. The point-cloud
+            # renderer has already constructed the multi-view image tensor.
+            rgb_img = img[:, :, 3:6, :, :]
 
+        if stage1_token_window is None:
+            prompts = [text[0][0] for text in language_goal]
+            images = [
+                [MVT.trans_cuda_tensor_2_PIL(example) for example in examples]
+                for examples in rgb_img
+            ]
+            assert len(prompts) == len(images)
+            model_inputs = self.processor(
+                text=prompts,
+                images=images,
+                return_tensors="pt",
+                padding="longest",
+            )
+            model_inputs = model_inputs.to(self.model.dtype).to(self.model.device)
 
-        prompts =[ text[0][0] for text in language_goal]# ["text1","text2"...]
-        # print("The prompts:",prompts)
-        images = [[MVT.trans_cuda_tensor_2_PIL(example)for example in examples] for examples in img]# bs,3
+            if all(not p.requires_grad for p in self.model.parameters()):
+                with torch.no_grad():
+                    outputs = self.model(
+                        **model_inputs,
+                        output_hidden_states=True,
+                    )
+            else:
+                outputs = self.model(
+                    **model_inputs,
+                    output_hidden_states=True,
+                )
 
+            x = outputs.hidden_states[-1]
+            current_tokens = []
 
-        assert len(prompts)==len(images)
-        model_inputs = self.processor(text=prompts, images=images, return_tensors="pt",padding="longest")
-        model_inputs = model_inputs.to(self.model.dtype).to(self.model.device)
-        outputs = self.model(**model_inputs, output_hidden_states=True)
-
-        hidden_states = outputs.hidden_states  
-
-        x = hidden_states[-1]  # get the features of the last layer
-
-
-        # get image tokens
-        image_tokens= []
-
-        # Process every batch
-        for i in range(bs):
-            # Get the ids and output of the current batch
-            current_ids = model_inputs["attention_mask"][i]
-            current_output = x[i]
+            # Extract the visual tokens from the current PaliGemma output.
+            for i in range(bs):
+                current_ids = model_inputs["attention_mask"][i]
+                current_output = x[i]
             
-            # Extract tokens corresponding to non-zero ids
-            non_zero_indices = torch.nonzero(current_ids != 0, as_tuple=True)[0]  # Find the indices of non-zero ids
-            non_zero_output = current_output[non_zero_indices]  # Extract the token outputs corresponding to these non-zero ids
+                non_zero_indices = torch.nonzero(
+                    current_ids != 0, as_tuple=True
+                )[0]
+                non_zero_output = current_output[non_zero_indices]
             
-            # Take the first 256 tokens (if the number of non-zero tokens is greater than 256, take the first 256)
-            assert non_zero_output.shape[0] > 256*self.num_img
-            non_zero_output = non_zero_output[:256*self.num_img]
-            
-            # Add the processed output to the new output list
-            image_tokens.append(non_zero_output)
+                assert non_zero_output.shape[0] > 256 * self.num_img
+                current_tokens.append(non_zero_output[: 256 * self.num_img])
+            current_tokens = torch.stack(current_tokens)
 
-        # concat all the output
-        image_tokens = torch.stack(image_tokens)
+            if stage1_history_tokens is not None:
+                past_tokens = stage1_history_tokens
+                if past_tokens.ndim == 3:
+                    past_tokens = past_tokens.unsqueeze(1)
+                if past_tokens.ndim != 4:
+                    raise ValueError(
+                        "stage1_history_tokens must have shape [B, K-1, S, D]"
+                    )
+                past_tokens = past_tokens.to(
+                    device=current_tokens.device,
+                    dtype=current_tokens.dtype,
+                )
+                if (
+                    past_tokens.shape[0] != bs
+                    or past_tokens.shape[2:] != current_tokens.shape[1:]
+                ):
+                    raise ValueError(
+                        "stage1_history_tokens shape does not match current tokens: "
+                        f"past={tuple(past_tokens.shape)}, "
+                        f"current={tuple(current_tokens.shape)}"
+                    )
+                token_window = torch.cat(
+                    [past_tokens, current_tokens.unsqueeze(1)], dim=1
+                )
+                if stage1_history_mask is None:
+                    history_mask = torch.ones(
+                        bs,
+                        past_tokens.shape[1],
+                        dtype=torch.bool,
+                        device=current_tokens.device,
+                    )
+                else:
+                    history_mask = stage1_history_mask.to(
+                        device=current_tokens.device,
+                        dtype=torch.bool,
+                    )
+                token_mask = torch.cat(
+                    [
+                        history_mask,
+                        torch.ones(
+                            bs,
+                            1,
+                            dtype=torch.bool,
+                            device=current_tokens.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+            else:
+                token_window = current_tokens.unsqueeze(1)
+                token_mask = None
+        else:
+            token_window = stage1_token_window
+            if token_window.ndim == 3:
+                token_window = token_window.unsqueeze(1)
+            if token_window.ndim != 4:
+                raise ValueError(
+                    "stage1_token_window must have shape [B, K, S, D]"
+                )
+            token_window = token_window.to(device=img.device)
+            if (
+                token_window.shape[0] != bs
+                or token_window.shape[2] != 256 * self.num_img
+            ):
+                raise ValueError(
+                    "stage1_token_window has incompatible shape: "
+                    f"{tuple(token_window.shape)}"
+                )
+            token_mask = stage1_token_mask
+            current_tokens = token_window[:, -1]
+
+        image_tokens = self.stage1_token_adapter(token_window, token_mask)
         x = rearrange(image_tokens, 'b (c h1 h2) w -> b w c h1 h2', c=self.num_img, h1=self.num_pat_img, h2=self.num_pat_img) 
         feat = []
         _feat = torch.max(torch.max(x, dim=-1)[0], dim=-1)[0]
@@ -435,6 +535,8 @@ class MVT(nn.Module):
             out = {}
 
         out.update({"trans": trans})
+        if return_stage1_tokens:
+            out["stage1_tokens"] = current_tokens.detach()
 
         return out
 

@@ -152,6 +152,37 @@ def dump_log(exp_cfg, mvt_cfg, cmd_args, log_dir):
 
 
 
+def load_initial_checkpoint(backbone, checkpoint_path):
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=True
+    )
+    state = checkpoint.get("model_state", checkpoint)
+    missing, unexpected = backbone.load_state_dict(state, strict=False)
+    unexpected = list(unexpected)
+    missing = [
+        key
+        for key in missing
+        if not key.startswith("mvt1.stage1_token_adapter.")
+    ]
+    if unexpected or missing:
+        raise RuntimeError(
+            "Initial checkpoint is incompatible with the Stage-1 model: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    print(
+        f"Loaded initial checkpoint: {checkpoint_path} "
+        f"(epoch={checkpoint.get('epoch', 'unknown')})"
+    )
+
+
+def freeze_for_stage1_adapter(backbone):
+    for parameter in backbone.parameters():
+        parameter.requires_grad = False
+    for parameter in backbone.mvt1.stage1_token_adapter.parameters():
+        parameter.requires_grad = True
+    print("Training only mvt1.stage1_token_adapter")
+
+
 def setup_distributed(backend="nccl", port=None):
     """Initialize distributed training environment.
     support both slurm and torch.distributed.launch
@@ -178,11 +209,11 @@ def setup_distributed(backend="nccl", port=None):
     else:
         if os.getenv('DEBUG', 'false').lower() == 'true':
             print("Can not find RANK and WORLD_SIZE, Debug Mode")
-            os.environ["RANK"] = "0"
-            os.environ["WORLD_SIZE"] = "1"
-            os.environ["MASTER_ADDR"] = "127.0.0.1"
-            os.environ["MASTER_PORT"] = "9001"
-            os.environ["LOCAL_RANK"] = "0"
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "9001")
+            os.environ.setdefault("LOCAL_RANK", "0")
             rank = int(os.environ["RANK"])
             world_size = int(os.environ["WORLD_SIZE"])
         else:
@@ -228,7 +259,7 @@ def experiment(cmd_args):
         print(f"dict(exp_cfg)={dict(exp_cfg)}")
         print(f"BATCH_SIZE_TRAIN={BATCH_SIZE_TRAIN}")
 
-    NUM_TRAIN = 100
+    NUM_TRAIN = cmd_args.num_train
     # to match peract, iterations per epoch
     TRAINING_ITERATIONS = int(exp_cfg.train_iter // (exp_cfg.bs * dist.get_world_size()))
 
@@ -236,7 +267,7 @@ def experiment(cmd_args):
         print(f"cmd args epochs != exp cfg epochs You are using {cmd_args.epochs}")
     EPOCHS = cmd_args.epochs
 
-    data_folder=DATA_FOLDER        
+    data_folder = cmd_args.data_folder
     log_dir = get_logdir(cmd_args, exp_cfg,dist)
     tasks = get_tasks(exp_cfg)
     print("Training on {} tasks: {}".format(len(tasks), tasks))
@@ -245,7 +276,7 @@ def experiment(cmd_args):
         tasks,
         BATCH_SIZE_TRAIN,
         None,
-        TRAIN_REPLAY_STORAGE_DIR,
+        cmd_args.train_replay_storage_dir,
         None,
         data_folder,
         NUM_TRAIN,
@@ -255,6 +286,7 @@ def experiment(cmd_args):
         num_workers=exp_cfg.num_workers,
         only_train=True,
         sample_distribution_mode=exp_cfg.sample_distribution_mode,
+        clip_cache_dir=cmd_args.clip_cache_dir,
     )
     train_dataset, _ = get_dataset_func()
     t_end = time.time()
@@ -268,6 +300,14 @@ def experiment(cmd_args):
         mvt_cfg.merge_from_list(cmd_args.mvt_cfg_opts.split(" "))
 
     mvt_cfg.feat_dim = get_num_feat(exp_cfg.peract)
+    if (
+        cmd_args.stage1_adapter_only
+        and mvt_cfg.stage1_history_len > 1
+        and cmd_args.stage1_token_cache_dir is None
+    ):
+        raise ValueError(
+            "K>1 Stage-1 training requires --stage1_token_cache_dir"
+        )
     mvt_cfg.freeze()
 
     # for maintaining backward compatibility
@@ -275,15 +315,29 @@ def experiment(cmd_args):
         mvt_cfg.num_rot, exp_cfg.peract.num_rotation_classes
     )
 
+    if cmd_args.stage1_adapter_only and cmd_args.init_checkpoint is None:
+        raise ValueError(
+            "--stage1_adapter_only requires --init_checkpoint so that the "
+            "frozen action heads start from a trained checkpoint"
+        )
+    if cmd_args.init_checkpoint is not None and cmd_args.load_pretrain:
+        raise ValueError(
+            "Use either --init_checkpoint or --load_pretrain, not both"
+        )
+
     backbone = MVT(
         renderer_device=device_id,
         load_pretrain=cmd_args.load_pretrain,
         pretrain_path=cmd_args.pretrain_path,
         **mvt_cfg,
     )
-    backbone=backbone.to(local_rank)
-    # if ddp:
-    backbone = DDP(backbone, device_ids=[local_rank],find_unused_parameters=True)
+    if cmd_args.init_checkpoint is not None:
+        load_initial_checkpoint(backbone, cmd_args.init_checkpoint)
+    if cmd_args.stage1_adapter_only:
+        freeze_for_stage1_adapter(backbone)
+
+    backbone = backbone.to(local_rank)
+    backbone = DDP(backbone, device_ids=[local_rank], find_unused_parameters=True)
 
     agent = bridgevla_agent.RVTAgent(
         network=backbone,
@@ -293,6 +347,8 @@ def experiment(cmd_args):
         scene_bounds=SCENE_BOUNDS,
         cameras=CAMERAS,
         log_dir=f"{log_dir}/test_run/",
+        stage1_token_cache_dir=cmd_args.stage1_token_cache_dir,
+        stage1_adapter_only=cmd_args.stage1_adapter_only,
         **exp_cfg.peract,
         **exp_cfg.rvt,
     )
@@ -331,10 +387,18 @@ def experiment(cmd_args):
         exp_cfg.freeze()
     # Initialize Logging =>> W&B
     if dist.get_rank() == 0:
-        wandb.login(key="")
-        if  cmd_args.debug:
-            wandb.init(entity="", project="", name=os.path.dirname(log_dir),mode="")
+        wandb_mode = os.environ.get("WANDB_MODE", "")
+        if wandb_mode == "disabled":
+            wandb.init(mode="disabled")
+        elif cmd_args.debug:
+            wandb.init(
+                entity="",
+                project="",
+                name=os.path.dirname(log_dir),
+                mode="offline",
+            )
         else:
+            wandb.login(key="")
             wandb.init(entity="", project="", name=os.path.dirname(log_dir))
 
     print("Start training ...", flush=True)
@@ -373,8 +437,17 @@ if __name__ == "__main__":
     parser.add_argument("--log_dir", type=str, default="")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--num_train", type=int, default=100)
+    parser.add_argument("--data_folder", type=str, default=DATA_FOLDER)
+    parser.add_argument(
+        "--train_replay_storage_dir", type=str, default=TRAIN_REPLAY_STORAGE_DIR
+    )
+    parser.add_argument("--clip_cache_dir", type=str, default=None)
     parser.add_argument("--freeze_vision_tower", action="store_true")
     parser.add_argument("--load_pretrain", action="store_true")
     parser.add_argument("--pretrain_path", type=str, default=None)
+    parser.add_argument("--init_checkpoint", type=str, default=None)
+    parser.add_argument("--stage1_adapter_only", action="store_true")
+    parser.add_argument("--stage1_token_cache_dir", type=str, default=None)
     cmd_args = parser.parse_args()
     experiment(cmd_args)
