@@ -159,10 +159,14 @@ def load_initial_checkpoint(backbone, checkpoint_path):
     state = checkpoint.get("model_state", checkpoint)
     missing, unexpected = backbone.load_state_dict(state, strict=False)
     unexpected = list(unexpected)
+    allowed_missing_prefixes = (
+        "mvt1.stage1_token_adapter.",
+        "mvt1.stage1_hidden_state_update.",
+    )
     missing = [
         key
         for key in missing
-        if not key.startswith("mvt1.stage1_token_adapter.")
+        if not key.startswith(allowed_missing_prefixes)
     ]
     if unexpected or missing:
         raise RuntimeError(
@@ -178,9 +182,15 @@ def load_initial_checkpoint(backbone, checkpoint_path):
 def freeze_for_stage1_adapter(backbone):
     for parameter in backbone.parameters():
         parameter.requires_grad = False
-    for parameter in backbone.mvt1.stage1_token_adapter.parameters():
-        parameter.requires_grad = True
-    print("Training only mvt1.stage1_token_adapter")
+    trainable_modules = [backbone.mvt1.stage1_token_adapter]
+    hidden_state_update = getattr(backbone.mvt1, "stage1_hidden_state_update", None)
+    if hidden_state_update is not None:
+        trainable_modules.append(hidden_state_update)
+    for module in trainable_modules:
+        for parameter in module.parameters():
+            parameter.requires_grad = True
+    trainable_names = [module.__class__.__name__ for module in trainable_modules]
+    print("Training only Stage-1 modules: " + ", ".join(trainable_names))
 
 
 def setup_distributed(backend="nccl", port=None):
@@ -300,13 +310,36 @@ def experiment(cmd_args):
         mvt_cfg.merge_from_list(cmd_args.mvt_cfg_opts.split(" "))
 
     mvt_cfg.feat_dim = get_num_feat(exp_cfg.peract)
+    stage1_adapter_mode = str(
+        getattr(mvt_cfg, "stage1_adapter_mode", "auto")
+    )
+    stage1_history_len = int(getattr(mvt_cfg, "stage1_history_len", 1))
+    stage1_loss_history_len = int(
+        getattr(mvt_cfg, "stage1_loss_history_len", 0)
+    )
+    stage1_temporal_loss_weight = float(
+        getattr(mvt_cfg, "stage1_temporal_loss_weight", 0.0)
+    )
+    legacy_temporal = stage1_adapter_mode == "legacy_temporal" or (
+        stage1_adapter_mode == "auto"
+        and stage1_history_len > 1
+        and stage1_loss_history_len == 0
+    )
+    needs_history_cache = (
+        (legacy_temporal and stage1_history_len > 1)
+        or (
+            stage1_adapter_mode == "current_correction"
+            and stage1_temporal_loss_weight > 0
+            and stage1_loss_history_len > 0
+        )
+    )
     if (
         cmd_args.stage1_adapter_only
-        and mvt_cfg.stage1_history_len > 1
+        and needs_history_cache
         and cmd_args.stage1_token_cache_dir is None
     ):
         raise ValueError(
-            "K>1 Stage-1 training requires --stage1_token_cache_dir"
+            "history-aware Stage-1 training requires --stage1_token_cache_dir"
         )
     mvt_cfg.freeze()
 

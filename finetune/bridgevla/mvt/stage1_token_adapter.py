@@ -1,4 +1,10 @@
-"""Small temporal adapter for frozen Stage-1 PaliGemma visual tokens."""
+"""Legacy historical-fusion adapter for archived Stage-1 experiments.
+
+The active route uses ``Stage1TokenCorrectionAdapter`` instead. This module is
+kept only so archived temporal-fusion checkpoints can still be inspected when
+``stage1_adapter_mode=legacy_temporal`` (or the compatibility ``auto`` mode)
+is selected.
+"""
 
 import math
 

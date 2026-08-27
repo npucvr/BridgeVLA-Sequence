@@ -1,4 +1,8 @@
-"""Disk-backed keypoint token cache for the frozen Stage-1 encoder."""
+"""Disk-backed causal keypoint token cache for Stage-1 history losses.
+
+The active current-token adapter never receives the returned history window;
+RVTAgent uses it only to construct the auxiliary temporal loss.
+"""
 
 from pathlib import Path
 

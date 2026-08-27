@@ -32,8 +32,21 @@ _C.st_wpt_loc_aug = 0.05
 _C.st_wpt_loc_inp_no_noise = False
 _C.img_aug_2 = 0.0
 _C.paligemma_path = ""
+# Legacy temporal-fusion window. Kept for loading archived checkpoints.
 _C.stage1_history_len = 1
 _C.stage1_adapter_bottleneck = 128
+
+# Current route: the adapter sees only the current token. Historical tokens are
+# used by the auxiliary training loss through these two settings.
+_C.stage1_adapter_mode = "auto"
+_C.stage1_loss_history_len = 0
+_C.stage1_temporal_loss_weight = 0.0
+
+# Lightweight recurrent hidden-state route. Kept opt-in until sequence training
+# and online rollout validation are complete.
+_C.stage1_hidden_state_enabled = False
+_C.stage1_hidden_state_dim = 128
+_C.stage1_hidden_state_action_dim = 8
 
 
 def get_cfg_defaults():
