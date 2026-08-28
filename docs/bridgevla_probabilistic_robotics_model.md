@@ -1,135 +1,168 @@
 # BridgeVLA 的概率机器人建模
 
-当前 BridgeVLA 只考虑观测时刻 $t_o$ 和目标时刻 $t_g$，满足 $t_o<t_g$。在每次决策开始时，$y_{t_o}$ 是策略当前的 hidden state；动作执行结束后得到新的 hidden state $y_{t_g}$。
+BridgeVLA 将 RLBench 的环境观测编码为 tokens 和 hidden state，并据此产生动作。本文采用《概率机器人》的状态空间模型：$x_t$ 是真实状态，$z_t$ 是观测，$y_t$ 是对状态或 belief 的可学习表示。
 
-## 符号
+## 1. 状态、观测与 belief
 
 | 符号 | 含义 |
 |---|---|
-| $t_o$ | 观测时刻 |
-| $t_g$ | 目标时刻 |
-| $x_{t_o},x_{t_g}$ | 两个时刻的环境隐状态 |
-| $z_{t_o}$ | 观测时刻可获得的 RGB、深度和点云观测 |
+| $x_t$ | RLBench simulator 在时刻 $t$ 的真实状态，策略不可直接访问 |
+| $z_t$ | RLBench 返回的 RGB、深度、点云和 proprioception 等观测 |
+| $u_t$ | 从时刻 $t$ 执行到 $t+1$ 的 waypoint action 或 action chunk |
 | $l$ | 语言任务目标 |
-| $H_{t_o}$ | PaliGemma 根据 $z_{t_o}$ 和 $l$ 产生的 tokens |
-| $y_{t_o},y_{t_g}$ | BridgeVLA 在两个时刻的 hidden state，$y\in\mathbb{R}^{d_y}$ |
-| $y_{\mathrm{init}}$ | episode 首次决策时的初始 hidden state，默认 $\mathbf{0}\in\mathbb{R}^{d_y}$ |
-| $\widetilde H_{t_o}$ | 注入 $y_{t_o}$ 后的修正 tokens |
-| $u_{t_o\to t_g}$ | 从观测时刻通向目标时刻的 waypoint action |
-| $p(\cdot\mid\cdot)$ | 观测或环境转移的概率模型 |
-| $\pi_\theta(\cdot\mid\cdot)$ | BridgeVLA 的 waypoint policy |
-| $F_\phi$ | 更新 hidden state 的可训练模块 |
-| $A_\psi$ | 修正 tokens 的可训练模块 |
-| $\pi^*$ | 已知真实环境状态时的理想策略 |
-| $\pi^*_{\mathrm{obs}},\pi^*_y$ | 分别表示只使用观测和同时使用观测、hidden state 时的理想策略 |
+| $H_t$ | $\mathrm{PaliGemma}(z_t,l)$ 产生的 tokens |
+| $y_t^-$ | 当前观测到达前的预测 hidden state |
+| $y_t$ | 吸收当前观测后的 hidden state |
+| $F_\phi$ | 动作条件下的状态转移预测 |
+| $U_\omega$ | 观测更新，用 PaliGemma tokens $H_t$ 校正预测状态 |
+| $p_\eta(z\mid y)$ | observation decoder |
+| $A_\psi$ | 用 hidden state 修正当前 tokens |
+| $\pi_\theta$ | waypoint policy |
 
-## 理论基础：观测条件策略的局限
-
-如果真实环境状态 $x_{t_o}$ 完整且可获得，理想的状态反馈策略可以写成 $\pi^*(u_{t_o\to t_g}\mid x_{t_o},l)$。但实际只能通过观测模型 $p(z_{t_o}\mid x_{t_o})$ 获得 $z_{t_o}$。
-
-观测噪声和遮挡会使不同的 $x_{t_o}$ 产生相似的 $z_{t_o}$。只使用当前观测时，理想策略可以写成：
+概率机器人模型由状态转移和观测过程组成：
 
 $$
-\pi^*_{\mathrm{obs}}(u_{t_o\to t_g}\mid z_{t_o},l)
-=\int
-\pi^*(u_{t_o\to t_g}\mid x_{t_o},l)\,
-p(x_{t_o}\mid z_{t_o},l)\,\mathrm{d}x_{t_o}.
+ x_1\sim p_0(x_1),
+ \qquad
+ x_{t+1}\sim p_{\mathrm{env}}(x_{t+1}\mid x_t,u_t),
+ \qquad
+ z_t\sim p_{\mathrm{env}}(z_t\mid x_t).
 $$
 
-如果 $y_{t_o}$ 能够保留与当前环境状态有关的时序信息，则策略可以使用更丰富的条件：
+对应的轨迹联合分布为：
 
 $$
-\pi^*_{y}(u_{t_o\to t_g}\mid z_{t_o},y_{t_o},l)
-=\int
-\pi^*(u_{t_o\to t_g}\mid x_{t_o},l)\,
-p(x_{t_o}\mid z_{t_o},y_{t_o},l)\,\mathrm{d}x_{t_o}.
+ p(x_{1:T},z_{1:T}\mid u_{1:T-1})
+ =p_0(x_1)
+ \prod_{t=1}^{T-1}p_{\mathrm{env}}(x_{t+1}\mid x_t,u_t)
+ \prod_{t=1}^{T}p_{\mathrm{env}}(z_t\mid x_t).
 $$
 
-引入 $y$ 的理论目标，是让当前 hidden state 在观测之外提供额外的状态信息。其信息增益可以形式化为：
+其中 $p_{\mathrm{env}}(z_t\mid x_t)$ 是 RLBench 的观测模型。概率形式不表示一定显式加入传感器噪声；即使渲染近似确定，遮挡和有限视角仍会造成部分可观测性。
+
+Bayes filter 的 belief 为：
 
 $$
-I(x_{t_o};y_{t_o}\mid z_{t_o},l)
-=\mathsf{H}(x_{t_o}\mid z_{t_o},l)
--\mathsf{H}(x_{t_o}\mid z_{t_o},y_{t_o},l)\ge 0.
+ b_t(x_t)=p(x_t\mid z_{1:t},u_{1:t-1}).
 $$
 
-当该互信息大于零时，$y_{t_o}$ 确实弥补了部分观测造成的信息缺失；但这个性质不是结构自动保证的，需要通过时序训练和消融实验验证。$y$ 仍然是任务相关的 hidden state，不等同于真实环境状态 $x$。
-
-## 当前流程
-
-### 1. 由环境状态生成观测
+它先进行动作预测：
 
 $$
-z_{t_o} \sim p(z_{t_o}\mid x_{t_o})
+ \bar b_t(x_t)
+ =\int p_{\mathrm{env}}(x_t\mid x_{t-1},u_{t-1})
+ b_{t-1}(x_{t-1})\,\mathrm{d}x_{t-1},
 $$
 
-观测时刻的环境状态 $x_{t_o}$ 通过观测模型产生当前观测 $z_{t_o}$。
-
-### 2. 由观测和语言生成 tokens
+再使用当前观测更新：
 
 $$
-H_{t_o}=\operatorname{PaliGemma}(z_{t_o},l)
+ b_t(x_t)=\eta\,p_{\mathrm{env}}(z_t\mid x_t)\bar b_t(x_t).
 $$
 
-PaliGemma 将当前观测和语言目标编码为 tokens $H_{t_o}$。
+## 2. BridgeVLA 的 hidden-state 表示
 
-### 3. 使用当前 tokens 和 hidden state 进行修正
-
-在每个 episode 的首次决策时，初始化 $y_{t_o}=y_{\mathrm{init}}$，其中 $y_{\mathrm{init}}=\mathbf{0}\in\mathbb{R}^{d_y}$；后续决策沿用上一轮执行结束后得到的 hidden state。
+完整的 hidden-state filter 对应：
 
 $$
-\widetilde H_{t_o}=H_{t_o}+A_\psi(H_{t_o},y_{t_o})
+ H_t=\mathrm{PaliGemma}(z_t,l),
+ \qquad
+ y_t^-=F_\phi(y_{t-1},u_{t-1}),
+ \qquad
+ y_t=U_\omega(y_t^-,H_t).
 $$
 
-修正模块同时接收当前 tokens $H_{t_o}$ 和当前 hidden state $y_{t_o}$。因此，$y_{t_o}$ 不直接替代当前观测，而是作为时序状态参与当前 tokens 的修正。
-
-### 4. 由修正 tokens 生成 waypoint
+其中 $y_t^-$ 表示预测 belief，$y_t$ 表示吸收当前观测表示后的 belief。$U_\omega$ 内部如何处理 token 不在本文固定，可以使用 pooling、projection、cross-attention 或 gated update。策略使用当前 tokens 和 hidden state：
 
 $$
-\hat u_{t_o\to t_g}
-\sim
-\pi_\theta(u_{t_o\to t_g}\mid\widetilde H_{t_o})
+ \widetilde H_t=H_t+A_\psi(H_t,y_t),
 $$
 
-现有 MVT 处理和 action heads 统一包含在策略 $\pi_\theta$ 中。
-
-### 5. 执行 waypoint 并到达目标状态
-
 $$
-x_{t_g}\sim p(x_{t_g}\mid x_{t_o},\hat u_{t_o\to t_g})
+ u_t\sim\pi_\theta(u\mid\widetilde H_t,y_t,l).
 $$
 
-运动规划器执行 waypoint，使环境从 $x_{t_o}$ 转移到目标状态 $x_{t_g}$。
-
-### 6. 执行结束后更新 hidden state
+如果训练时可以访问 simulator state，可以增加：
 
 $$
-y_{t_g}=F_\phi(y_{t_o},\hat u_{t_o\to t_g})
+ \mathcal L_x
+ =\left\|P_y(y_t)-P_x(x_t)\right\|^2.
 $$
 
-$F_\phi$ 使用 $y_{t_o}$ 和刚执行的 waypoint 得到目标时刻的 hidden state $y_{t_g}$，供下一次决策使用。后续可以进一步利用目标时刻的新观测：先计算 $H_{t_g}=\operatorname{PaliGemma}(z_{t_g},l)$，再将更新扩展为 $y_{t_g}=F_\phi(y_{t_o},\hat u_{t_o\to t_g},H_{t_g})$，使 hidden state 也直接吸收新观测；这属于后续尝试，当前最简方案仍使用前式。
+否则，$y_t$ 更准确地被定义为 belief 或 predictive state representation，而不保证与完整 $x_t$ 在坐标上相同。
 
-## 训练目标
+## 3. 时间展开的数据流：状态、观测、隐状态与动作
 
-RLBench 的专家监督目标记为 $u^*_{t_o\to t_g}=\operatorname{Waypoint}(x_{t_g})$。训练时按时间顺序递推 $y$，行为克隆目标为：
+下面将 $t-1$、$t$ 和 $t+1$ 展开为数据节点。$x$ 由环境维护，$z$ 是每个时刻新产生的观测，$y$ 是模型维护的隐状态，$u$ 是连接策略和环境的动作反馈。
+
+运行时，实际观测 $z_t$ 先经 PaliGemma 形成 $H_t$，再由 $H_t$ 同时参与 token 修正和 hidden-state update；策略融合修正后的 tokens 与 $y_t$ 后输出 $u_t$。其中 $F_\phi$、$U_\omega$ 和 $A_\psi$ 是内部运算，$x_t$、$z_t$、$H_t$、$y_t$ 和 $u_t$ 是随时间展开的数据节点。本文不规定 $U_\omega$ 对 $H_t$ 的具体降维或注意力方式。observation decoder 仅用于训练辅助，不放入主控制路径。
+
+观测 decoder 近似预测 belief 经过环境观测模型后的分布：
 
 $$
-\mathcal L_{\mathrm{BC}}
-= -\mathbb E_{(z_{t_o},l,u^*_{t_o\to t_g})}
-\left[
-\log \pi_\theta(u^*_{t_o\to t_g}\mid\widetilde H_{t_o})
-\right].
+ p_\eta(z_{t+1}\mid y_{t+1}^-)
+ \approx
+ \int p_{\mathrm{env}}(z_{t+1}\mid x_{t+1})
+ q(x_{t+1}\mid y_{t+1}^-)\,\mathrm{d}x_{t+1}.
 $$
 
-## 轻量验证实现
+## 4. 训练目标
 
-当前代码提供一个显式开关 `hidden_state_enabled`，默认关闭以保持原始 checkpoint 的结构和行为；快速验证时可使用 `--mvt_cfg_opts "hidden_state_enabled True"`。实现只新增两个小模块：
+按 episode 顺序展开 $y$：
 
-1. `finetune/bridgevla/hidden_state/token_correction.py` 中的 `A_psi` 使用 token bottleneck，并把 $y_{t_o}$ 投影到同一个 bottleneck 后广播到各个 token；输出层零初始化，因此初始输出仍等于 $H_{t_o}$。
-2. `finetune/bridgevla/hidden_state/transition.py` 中的 `F_phi` 使用 action encoder 和紧凑的 `GRUCell` 实现 $F_\phi(y_{t_o},\hat u_{t_o\to t_g})$。
+$$
+ H_t=\mathrm{PaliGemma}(z_t,l),
+ \qquad
+ y_1=U_\omega(y_{\mathrm{init}},H_1),
+$$
 
-在线 rollout 中，episode 开始时通过 `reset()` 清空 $y$；第一次 `act()` 使用零初值；产生的 waypoint 在环境执行完成后，于下一次 `act()` 开始前更新 $y$。这样不会把尚未执行的动作反馈给当前决策，也不会在 `stage_two` 的两次 MVT forward 中重复更新。
+$$
+ y_{t+1}^-=F_\phi(y_t,u_t),
+ \qquad
+ y_{t+1}=U_\omega(y_{t+1}^-,H_{t+1}).
+$$
 
-当前 replay buffer 仍然独立采样单个 transition。因而普通单步行为克隆可以快速验证 token correction 的形状、初始化和 action loss 路径，但只有按时间顺序展开至少两个决策，第二个决策的行为克隆损失才会为 $F_\phi$ 提供梯度。真实序列训练应在该检查通过后再接入。
+行为克隆和观测预测损失为：
 
-历史 token-window、cache 和辅助损失 checkpoint 不再属于当前接口；需要从原始 BridgeVLA checkpoint 开启 `hidden_state_enabled` 后重新训练。关闭该开关时仍保持原始 checkpoint 的严格加载兼容性。
+$$
+ \mathcal L_{\mathrm{BC}}
+ =-\sum_t\log\pi_\theta(u_t^*\mid\widetilde H_t,y_t,l),
+$$
+
+$$
+ \mathcal L_{\mathrm{obs}}
+ =-\sum_t\log p_\eta(z_{t+1}\mid y_{t+1}^-).
+$$
+
+组合目标为：
+
+$$
+ \mathcal L
+ =\mathcal L_{\mathrm{BC}}
+ +\lambda_{\mathrm{obs}}\mathcal L_{\mathrm{obs}}
+ +\lambda_x\mathcal L_x.
+$$
+
+因此，$F_\phi$ 的训练需要跨多个连续 decision 展开；独立 transition replay 不能验证完整的 sequence-training 梯度。
+
+## 5. 当前实现边界
+
+当前代码实现的是轻量路由：
+
+$$
+ z_t\xrightarrow{\mathrm{PaliGemma}}H_t
+ \xrightarrow{A_\psi(\cdot,y_t)}\widetilde H_t,
+ \qquad
+ y_{t+1}=F_\phi(y_t,u_t).
+$$
+
+因此，当前动作仍然可以通过 PaliGemma 看到最新观测 $z_t$；但 $z_t$ 尚未通过 $U_\omega$ 写回未来的 hidden state。这正是轻量实现与完整 predict–observe–correct 模型之间的差距，而不是环境观测模型本身的断裂。
+
+当前尚未实现：
+
+- 使用当前 RLBench 观测更新 $y_t$ 的 $U_\omega$；
+- observation decoder $p_\eta(z\mid y)$；
+- 基于真实 simulator state 的 $\mathcal L_x$；
+- 完整的 episode-level sequence training。
+
+关闭 `hidden_state_enabled` 时仍保持原始 BridgeVLA checkpoint 的严格加载兼容性。历史 token-window、cache 和 temporal-loss 路径不属于当前接口。
