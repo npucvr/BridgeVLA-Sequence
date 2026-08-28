@@ -29,8 +29,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..."))
 import RLBench.utils.peract_utils_rlbench as rlbench_utils
 import GemBench.utils.peract_utils_gembench as gembench_utils
 import bridgevla.mvt.utils as mvt_utils
-from bridgevla.mvt.stage1_token_cache import Stage1KeypointTokenCache
-from bridgevla.mvt.stage1_temporal_loss import masked_history_cosine_loss
 import bridgevla.utils.rvt_utils as rvt_utils
 from bridgevla.mvt.augmentation import apply_se3_aug_con, aug_utils
 from yarr.agents.agent import ActResult
@@ -417,8 +415,7 @@ class RVTAgent:
         rot_ver: int = 0,
         rot_x_y_aug: int = 2,
         log_dir="",
-        stage1_token_cache_dir=None,
-        stage1_adapter_only=False,
+        hidden_state_route_only=False,
     ):
         self._network = network
         self._num_rotation_classes = num_rotation_classes
@@ -443,7 +440,7 @@ class RVTAgent:
         self.log_dir = log_dir
         self.scene_bounds = scene_bounds
         self.cameras = cameras
-        self._stage1_adapter_only = stage1_adapter_only
+        self._hidden_state_route_only = hidden_state_route_only
 
         print("Cameras:",self.cameras)
         self.move_pc_in_bound = move_pc_in_bound
@@ -456,59 +453,15 @@ class RVTAgent:
         else:
             self._net_mod = self._network
 
-        self._stage1_adapter_mode = getattr(
-            self._net_mod.mvt1, "stage1_adapter_mode", "legacy_temporal"
+        self._hidden_state_enabled = bool(
+            getattr(self._net_mod.mvt1, "hidden_state_enabled", False)
         )
-        self._stage1_current_token_only = (
-            self._stage1_adapter_mode == "current_correction"
-        )
-        self._stage1_hidden_state_enabled = bool(
-            getattr(self._net_mod.mvt1, "stage1_hidden_state_enabled", False)
-        )
-        self._stage1_hidden_state = None
-        self._stage1_pending_action = None
-        self._stage1_loss_history_len = int(
-            getattr(self._net_mod.mvt1, "stage1_loss_history_len", 0)
-        )
-        self._stage1_temporal_loss_weight = float(
-            getattr(self._net_mod.mvt1, "stage1_temporal_loss_weight", 0.0)
-        )
-        if self._stage1_loss_history_len < 0:
-            raise ValueError("stage1_loss_history_len must be >= 0")
-        if self._stage1_temporal_loss_weight < 0:
-            raise ValueError("stage1_temporal_loss_weight must be >= 0")
-        if (
-            self._stage1_adapter_only
-            and self._stage1_current_token_only
-            and self._stage1_temporal_loss_weight > 0
-        ):
-            if self._stage1_loss_history_len < 1:
-                raise ValueError(
-                    "stage1_temporal_loss_weight > 0 requires "
-                    "stage1_loss_history_len >= 1"
-                )
-            if stage1_token_cache_dir is None:
-                raise ValueError(
-                    "history-aware current-token training requires "
-                    "stage1_token_cache_dir"
-                )
-
-        if stage1_token_cache_dir is None:
-            self._stage1_token_cache = None
-        else:
-            cache_history = (
-                self._stage1_loss_history_len + 1
-                if self._stage1_current_token_only
-                else self._net_mod.mvt1.stage1_history_len
+        if self._hidden_state_route_only and not self._hidden_state_enabled:
+            raise ValueError(
+                "hidden_state_route_only requires hidden_state_enabled=True"
             )
-            self._stage1_token_cache = Stage1KeypointTokenCache(
-                stage1_token_cache_dir,
-                max_history=cache_history,
-            )
-
-        # The current route has no online history buffer. The list is retained
-        # only for archived legacy temporal-fusion checkpoints.
-        self._stage1_eval_history_tokens = []
+        self._hidden_state_y = None
+        self._pending_action = None
 
         self.num_all_rot = self._num_rotation_classes * 3
 
@@ -635,34 +588,34 @@ class RVTAgent:
 
         return q_trans, rot_q, grip_q, collision_q, y_q, pts
 
-    def _initial_stage1_hidden_state(self, batch_size, device):
+    def _initial_hidden_state(self, batch_size, device):
         """Create independent zero states for a shuffled training batch."""
-        if not self._stage1_hidden_state_enabled:
+        if not self._hidden_state_enabled:
             return None
-        return self._net_mod.initial_stage1_hidden_state(
+        return self._net_mod.initial_hidden_state(
             batch_size=batch_size,
             device=device,
         )
 
-    def _training_stage1_hidden_state(self, replay_sample, batch_size, device):
+    def _training_hidden_state(self, replay_sample, batch_size, device):
         """Read an optional externally unrolled state or start from zero.
 
         The default replay buffer samples transitions independently, so its
         rows must not share the agent's online state. A chronological sequence
-        trainer may provide ``stage1_hidden_state`` explicitly; this single-
+        trainer may provide ``hidden_state_y`` explicitly; this single-
         transition update does not infer ordering from replay metadata.
         """
-        state = replay_sample.get("stage1_hidden_state")
+        state = replay_sample.get("hidden_state_y")
         if state is None:
-            return self._initial_stage1_hidden_state(batch_size, device)
+            return self._initial_hidden_state(batch_size, device)
         if state.ndim == 3 and state.shape[1] == 1:
             state = state[:, 0]
         if state.ndim != 2 or state.shape[0] != batch_size:
             raise ValueError(
-                "stage1_hidden_state must have shape [B, D] or [B, 1, D], "
+                "hidden_state_y must have shape [B, D] or [B, 1, D], "
                 f"got {tuple(state.shape)}"
             )
-        expected_dim = int(self._net_mod.mvt1.stage1_hidden_state_dim)
+        expected_dim = int(self._net_mod.mvt1.hidden_state_dim)
         if state.shape[-1] != expected_dim:
             raise ValueError(
                 f"expected hidden state dim {expected_dim}, got {state.shape[-1]}"
@@ -692,22 +645,7 @@ class RVTAgent:
         # rotation in quaternion xyzw
         action_rot = action_gripper_pose[:, 3:7]  # (b, 4)
         action_grip = action_rot_grip[:, -1]  # (b,)
-        tasks = replay_sample["tasks"]
         return_out = {}
-
-        stage1_history_tokens = None
-        stage1_history_mask = None
-        if self._stage1_token_cache is not None:
-            stage1_history_tokens, stage1_history_mask = (
-                self._stage1_token_cache.get_batch(
-                    tasks,
-                    replay_sample["episode_idx"],
-                    replay_sample["keypoint_idx"],
-                    replay_sample.get("sample_frame"),
-                )
-            )
-            stage1_history_tokens = stage1_history_tokens.to(self._device)
-            stage1_history_mask = stage1_history_mask.to(self._device)
 
         obs, pcd = rlbench_utils._preprocess_inputs(replay_sample, self.cameras)
         
@@ -801,24 +739,13 @@ class RVTAgent:
                 ).to(rot_x_y.device)
                 rot_x_y %= self._num_rotation_classes
         
-        stage1_forward_kwargs = {}
-        if self._stage1_hidden_state_enabled:
-            stage1_forward_kwargs["stage1_hidden_state"] = (
-                self._training_stage1_hidden_state(
-                    replay_sample=replay_sample,
-                    batch_size=bs,
-                    device=pc[0].device,
-                )
+        hidden_state_kwargs = {}
+        if self._hidden_state_enabled:
+            hidden_state_kwargs["hidden_state_y"] = self._training_hidden_state(
+                replay_sample=replay_sample,
+                batch_size=bs,
+                device=pc[0].device,
             )
-        if not self._stage1_current_token_only:
-            stage1_forward_kwargs.update(
-                stage1_history_tokens=stage1_history_tokens,
-                stage1_history_mask=stage1_history_mask,
-            )
-        elif backprop:
-            # The correction graph is needed by the history-aware loss. It is
-            # never needed during online inference.
-            stage1_forward_kwargs["return_stage1_tokens"] = True
 
         out = self._network(
             pc=pc,
@@ -828,7 +755,7 @@ class RVTAgent:
             wpt_local=wpt_local if self._network.training else None,
             rot_x_y=rot_x_y if self.rot_ver == 1 else None,
             language_goal=replay_sample["lang_goal"],
-            **stage1_forward_kwargs,
+            **hidden_state_kwargs,
         )
         
         q_trans, rot_q, grip_q, collision_q, y_q, pts = self.get_q(
@@ -882,26 +809,6 @@ class RVTAgent:
                     collision_q, action_collision_one_hot.argmax(-1)
                 ).mean()
 
-            temporal_loss = trans_loss.new_zeros(())
-            if (
-                self._stage1_current_token_only
-                and self._stage1_temporal_loss_weight > 0
-            ):
-                corrected_tokens = out.get("stage1_corrected_tokens")
-                if corrected_tokens is None:
-                    raise RuntimeError(
-                        "current-token MVT output is missing stage1_corrected_tokens"
-                    )
-                if stage1_history_tokens is None or stage1_history_mask is None:
-                    raise RuntimeError(
-                        "history-aware loss requires causal history tokens and mask"
-                    )
-                temporal_loss = masked_history_cosine_loss(
-                    corrected_tokens,
-                    stage1_history_tokens,
-                    stage1_history_mask,
-                )
-
             total_loss = (
                 trans_loss
                 + rot_loss_x
@@ -909,7 +816,6 @@ class RVTAgent:
                 + rot_loss_z
                 + grip_loss
                 + collision_loss
-                + self._stage1_temporal_loss_weight * temporal_loss
             )
 
 
@@ -927,10 +833,6 @@ class RVTAgent:
                 "rot_loss_z": rot_loss_z.item(),
                 "grip_loss": grip_loss.item(),
                 "collision_loss": collision_loss.item(),
-                "temporal_loss": temporal_loss.item(),
-                "weighted_temporal_loss": (
-                    self._stage1_temporal_loss_weight * temporal_loss
-                ).item(),
                 "lr": self._optimizer.param_groups[0]["lr"],
             }
             manage_loss_log(self, loss_log, reset_log=reset_log)
@@ -958,9 +860,6 @@ class RVTAgent:
 
         action_grip = action_gripper_pose[:, -1].int()   # (b,)
         return_out = {}
-        stage1_history_tokens = None
-        stage1_history_mask = None
-
         obs, pcd = gembench_utils._preprocess_inputs_gembench(replay_sample, cameras)
         
         with torch.no_grad():
@@ -1060,24 +959,13 @@ class RVTAgent:
                 ).to(rot_x_y.device)
                 rot_x_y %= self._num_rotation_classes
         
-        stage1_forward_kwargs = {}
-        if self._stage1_hidden_state_enabled:
-            stage1_forward_kwargs["stage1_hidden_state"] = (
-                self._training_stage1_hidden_state(
-                    replay_sample=replay_sample,
-                    batch_size=bs,
-                    device=pc[0].device,
-                )
+        hidden_state_kwargs = {}
+        if self._hidden_state_enabled:
+            hidden_state_kwargs["hidden_state_y"] = self._training_hidden_state(
+                replay_sample=replay_sample,
+                batch_size=bs,
+                device=pc[0].device,
             )
-        if not self._stage1_current_token_only:
-            stage1_forward_kwargs.update(
-                stage1_history_tokens=stage1_history_tokens,
-                stage1_history_mask=stage1_history_mask,
-            )
-        elif backprop:
-            # The correction graph is needed by the history-aware loss. It is
-            # never needed during online inference.
-            stage1_forward_kwargs["return_stage1_tokens"] = True
 
         out = self._network(
             pc=pc,
@@ -1087,7 +975,7 @@ class RVTAgent:
             wpt_local=wpt_local if self._network.training else None,
             rot_x_y=rot_x_y if self.rot_ver == 1 else None,
             language_goal=replay_sample["lang_goal"],
-            **stage1_forward_kwargs,
+            **hidden_state_kwargs,
         )
         
         q_trans, rot_q, grip_q, collision_q, y_q, pts = self.get_q(
@@ -1139,9 +1027,6 @@ class RVTAgent:
                     collision_q, action_collision_one_hot.argmax(-1)
                 ).mean()
 
-            # GemBench does not provide the RLBench causal token cache; keep
-            # the auxiliary term explicitly disabled on this path.
-            temporal_loss = trans_loss.new_zeros(())
             total_loss = (
                 trans_loss
                 + rot_loss_x
@@ -1163,10 +1048,6 @@ class RVTAgent:
                 "rot_loss_z": rot_loss_z.item(),
                 "grip_loss": grip_loss.item(),
                 "collision_loss": collision_loss.item(),
-                "temporal_loss": temporal_loss.item(),
-                "weighted_temporal_loss": (
-                    self._stage1_temporal_loss_weight * temporal_loss
-                ).item(),
                 "lr": self._optimizer.param_groups[0]["lr"],
             }
             manage_loss_log(self, loss_log, reset_log=reset_log)
@@ -1208,87 +1089,38 @@ class RVTAgent:
         h = w = self._net_mod.img_size
         dyn_cam_info = None
 
-        stage1_forward_kwargs = {}
-        if self._stage1_hidden_state_enabled:
+        hidden_state_kwargs = {}
+        if self._hidden_state_enabled:
             token_device = pc[0].device
-            if self._stage1_pending_action is not None:
-                if self._stage1_hidden_state is None:
-                    self._stage1_hidden_state = self._initial_stage1_hidden_state(
+            if self._pending_action is not None:
+                if self._hidden_state_y is None:
+                    self._hidden_state_y = self._initial_hidden_state(
                         batch_size=bs,
                         device=token_device,
                     )
-                self._stage1_hidden_state = self._net_mod.update_stage1_hidden_state(
-                    self._stage1_hidden_state,
-                    self._stage1_pending_action.to(device=token_device),
+                self._hidden_state_y = self._net_mod.update_hidden_state(
+                    self._hidden_state_y,
+                    self._pending_action.to(device=token_device),
                 ).detach()
-                self._stage1_pending_action = None
+                self._pending_action = None
 
             if (
-                self._stage1_hidden_state is None
-                or self._stage1_hidden_state.shape[0] != bs
+                self._hidden_state_y is None
+                or self._hidden_state_y.shape[0] != bs
             ):
-                self._stage1_hidden_state = self._initial_stage1_hidden_state(
+                self._hidden_state_y = self._initial_hidden_state(
                     batch_size=bs,
                     device=token_device,
                 )
-            stage1_forward_kwargs["stage1_hidden_state"] = self._stage1_hidden_state
-        if not self._stage1_current_token_only:
-            # Archived temporal-fusion checkpoints retain their online causal
-            # window. The current route intentionally skips this entire path.
-            stage1_history_tokens = None
-            stage1_history_mask = None
-            return_stage1_tokens = False
-            stage1_history_len = int(
-                getattr(self._net_mod.mvt1, "stage1_history_len", 1)
-            )
-            if stage1_history_len > 1:
-                history_slots = stage1_history_len - 1
-                token_sequence = self._net_mod.mvt1.num_img * 256
-                token_dim = self._net_mod.mvt1.vlm_dim
-                token_dtype = next(self._net_mod.mvt1.model.parameters()).dtype
-                token_device = pc[0].device
-                stage1_history_tokens = torch.zeros(
-                    bs,
-                    history_slots,
-                    token_sequence,
-                    token_dim,
-                    device=token_device,
-                    dtype=token_dtype,
-                )
-                stage1_history_mask = torch.zeros(
-                    bs, history_slots, dtype=torch.bool, device=token_device
-                )
-                previous = self._stage1_eval_history_tokens[-history_slots:]
-                if previous:
-                    start = history_slots - len(previous)
-                    stage1_history_tokens[:, start:] = torch.stack(
-                        [
-                            token.to(device=token_device, dtype=token_dtype)
-                            for token in previous
-                        ],
-                        dim=1,
-                    )
-                    stage1_history_mask[:, start:] = True
-                return_stage1_tokens = True
-            stage1_forward_kwargs.update(
-                stage1_history_tokens=stage1_history_tokens,
-                stage1_history_mask=stage1_history_mask,
-                return_stage1_tokens=return_stage1_tokens,
-            )
+            hidden_state_kwargs["hidden_state_y"] = self._hidden_state_y
 
         out = self._network(
             pc=pc,
             img_feat=img_feat,
             img_aug=0,  # no img augmentation while acting
             language_goal=language_goal,
-            **stage1_forward_kwargs,
+            **hidden_state_kwargs,
         )
-        if not self._stage1_current_token_only and return_stage1_tokens:
-            current_tokens = out.get("stage1_tokens")
-            if current_tokens is None:
-                raise RuntimeError("MVT did not return online Stage-1 tokens")
-            self._stage1_eval_history_tokens.append(current_tokens.detach())
-            del self._stage1_eval_history_tokens[:-history_slots]
         if visualize:
             q_trans, rot_q, grip_q, collision_q, y_q, _ = self.get_q(
                 out, dims=(bs, nc, h, w), only_pred=True, get_q_trans=True
@@ -1319,7 +1151,7 @@ class RVTAgent:
             visualize_images(mvt2_img,q_trans_2,save_dir=os.path.join(save_dir,"mvt2"))
             save_point_cloud_with_color(os.path.join(save_dir,"point_cloud.ply"), pc_ori.cpu().numpy(), img_feat_ori.cpu().numpy(), pred_wpt[0].cpu().numpy())
 
-        if self._stage1_hidden_state_enabled:
+        if self._hidden_state_enabled:
             rotation = torch.as_tensor(
                 pred_rot_quat,
                 device=pred_wpt.device,
@@ -1330,7 +1162,7 @@ class RVTAgent:
                 dim=-1,
             )
             expected_action_dim = int(
-                self._net_mod.mvt1.stage1_hidden_state_action_dim
+                self._net_mod.mvt1.hidden_state_action_dim
             )
             if state_action.shape[-1] != expected_action_dim:
                 raise RuntimeError(
@@ -1341,7 +1173,7 @@ class RVTAgent:
             # The environment executes this action between the current and
             # next act() calls.  It is consumed at the beginning of the next
             # call, so the state update is causally after execution.
-            self._stage1_pending_action = state_action.detach()
+            self._pending_action = state_action.detach()
 
         continuous_action = np.concatenate(
             (
@@ -1464,22 +1296,18 @@ class RVTAgent:
 
 
     def reset(self):
-        self._stage1_eval_history_tokens.clear()
-        self._stage1_hidden_state = None
-        self._stage1_pending_action = None
+        self._hidden_state_y = None
+        self._pending_action = None
 
     def eval(self):
         self._network.eval()
 
     def train(self):
         self._network.train()
-        if self._stage1_adapter_only:
-            trainable_stage1_modules = {"stage1_token_adapter"}
-            if self._stage1_hidden_state_enabled:
-                trainable_stage1_modules.add("stage1_hidden_state_update")
+        if self._hidden_state_route_only:
+            trainable_hidden_modules = {"A_psi", "F_phi"}
             for name, module in self._net_mod.mvt1.named_children():
-                if name not in trainable_stage1_modules:
+                if name not in trainable_hidden_modules:
                     module.eval()
-            self._net_mod.mvt1.stage1_token_adapter.train()
-            if self._stage1_hidden_state_enabled:
-                self._net_mod.mvt1.stage1_hidden_state_update.train()
+            self._net_mod.mvt1.A_psi.train()
+            self._net_mod.mvt1.F_phi.train()

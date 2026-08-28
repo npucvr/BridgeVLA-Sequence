@@ -160,8 +160,9 @@ def load_initial_checkpoint(backbone, checkpoint_path):
     missing, unexpected = backbone.load_state_dict(state, strict=False)
     unexpected = list(unexpected)
     allowed_missing_prefixes = (
-        "mvt1.stage1_token_adapter.",
-        "mvt1.stage1_hidden_state_update.",
+        ("mvt1.A_psi.", "mvt1.F_phi.")
+        if backbone.mvt1.hidden_state_enabled
+        else ()
     )
     missing = [
         key
@@ -170,7 +171,7 @@ def load_initial_checkpoint(backbone, checkpoint_path):
     ]
     if unexpected or missing:
         raise RuntimeError(
-            "Initial checkpoint is incompatible with the Stage-1 model: "
+            "Initial checkpoint is incompatible with the BridgeVLA model: "
             f"missing={missing}, unexpected={unexpected}"
         )
     print(
@@ -179,18 +180,20 @@ def load_initial_checkpoint(backbone, checkpoint_path):
     )
 
 
-def freeze_for_stage1_adapter(backbone):
+def freeze_for_hidden_state_route(backbone):
+    """Freeze BridgeVLA and train only ``A_psi`` and ``F_phi``."""
+    if not backbone.mvt1.hidden_state_enabled:
+        raise ValueError(
+            "hidden_state_route_only requires hidden_state_enabled=True"
+        )
     for parameter in backbone.parameters():
         parameter.requires_grad = False
-    trainable_modules = [backbone.mvt1.stage1_token_adapter]
-    hidden_state_update = getattr(backbone.mvt1, "stage1_hidden_state_update", None)
-    if hidden_state_update is not None:
-        trainable_modules.append(hidden_state_update)
+    trainable_modules = [backbone.mvt1.A_psi, backbone.mvt1.F_phi]
     for module in trainable_modules:
         for parameter in module.parameters():
             parameter.requires_grad = True
     trainable_names = [module.__class__.__name__ for module in trainable_modules]
-    print("Training only Stage-1 modules: " + ", ".join(trainable_names))
+    print("Training only hidden-state modules: " + ", ".join(trainable_names))
 
 
 def setup_distributed(backend="nccl", port=None):
@@ -310,36 +313,9 @@ def experiment(cmd_args):
         mvt_cfg.merge_from_list(cmd_args.mvt_cfg_opts.split(" "))
 
     mvt_cfg.feat_dim = get_num_feat(exp_cfg.peract)
-    stage1_adapter_mode = str(
-        getattr(mvt_cfg, "stage1_adapter_mode", "auto")
-    )
-    stage1_history_len = int(getattr(mvt_cfg, "stage1_history_len", 1))
-    stage1_loss_history_len = int(
-        getattr(mvt_cfg, "stage1_loss_history_len", 0)
-    )
-    stage1_temporal_loss_weight = float(
-        getattr(mvt_cfg, "stage1_temporal_loss_weight", 0.0)
-    )
-    legacy_temporal = stage1_adapter_mode == "legacy_temporal" or (
-        stage1_adapter_mode == "auto"
-        and stage1_history_len > 1
-        and stage1_loss_history_len == 0
-    )
-    needs_history_cache = (
-        (legacy_temporal and stage1_history_len > 1)
-        or (
-            stage1_adapter_mode == "current_correction"
-            and stage1_temporal_loss_weight > 0
-            and stage1_loss_history_len > 0
-        )
-    )
-    if (
-        cmd_args.stage1_adapter_only
-        and needs_history_cache
-        and cmd_args.stage1_token_cache_dir is None
-    ):
+    if cmd_args.hidden_state_route_only and not mvt_cfg.hidden_state_enabled:
         raise ValueError(
-            "history-aware Stage-1 training requires --stage1_token_cache_dir"
+            "--hidden_state_route_only requires hidden_state_enabled=True"
         )
     mvt_cfg.freeze()
 
@@ -348,10 +324,10 @@ def experiment(cmd_args):
         mvt_cfg.num_rot, exp_cfg.peract.num_rotation_classes
     )
 
-    if cmd_args.stage1_adapter_only and cmd_args.init_checkpoint is None:
+    if cmd_args.hidden_state_route_only and cmd_args.init_checkpoint is None:
         raise ValueError(
-            "--stage1_adapter_only requires --init_checkpoint so that the "
-            "frozen action heads start from a trained checkpoint"
+            "--hidden_state_route_only requires --init_checkpoint so that the "
+            "frozen BridgeVLA model starts from a trained checkpoint"
         )
     if cmd_args.init_checkpoint is not None and cmd_args.load_pretrain:
         raise ValueError(
@@ -366,8 +342,8 @@ def experiment(cmd_args):
     )
     if cmd_args.init_checkpoint is not None:
         load_initial_checkpoint(backbone, cmd_args.init_checkpoint)
-    if cmd_args.stage1_adapter_only:
-        freeze_for_stage1_adapter(backbone)
+    if cmd_args.hidden_state_route_only:
+        freeze_for_hidden_state_route(backbone)
 
     backbone = backbone.to(local_rank)
     backbone = DDP(backbone, device_ids=[local_rank], find_unused_parameters=True)
@@ -380,8 +356,7 @@ def experiment(cmd_args):
         scene_bounds=SCENE_BOUNDS,
         cameras=CAMERAS,
         log_dir=f"{log_dir}/test_run/",
-        stage1_token_cache_dir=cmd_args.stage1_token_cache_dir,
-        stage1_adapter_only=cmd_args.stage1_adapter_only,
+        hidden_state_route_only=cmd_args.hidden_state_route_only,
         **exp_cfg.peract,
         **exp_cfg.rvt,
     )
@@ -480,7 +455,6 @@ if __name__ == "__main__":
     parser.add_argument("--load_pretrain", action="store_true")
     parser.add_argument("--pretrain_path", type=str, default=None)
     parser.add_argument("--init_checkpoint", type=str, default=None)
-    parser.add_argument("--stage1_adapter_only", action="store_true")
-    parser.add_argument("--stage1_token_cache_dir", type=str, default=None)
+    parser.add_argument("--hidden_state_route_only", action="store_true")
     cmd_args = parser.parse_args()
     experiment(cmd_args)

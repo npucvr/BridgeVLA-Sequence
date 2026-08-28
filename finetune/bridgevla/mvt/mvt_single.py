@@ -26,9 +26,7 @@ from bridgevla.mvt.attn import (
     FixedPositionalEncoding,
 )
 from bridgevla.mvt.raft_utils import ConvexUpSample
-from bridgevla.mvt.stage1_token_adapter import Stage1TemporalTokenAdapter
-from bridgevla.mvt.stage1_token_correction_adapter import Stage1TokenCorrectionAdapter
-from bridgevla.mvt.stage1_hidden_state import Stage1HiddenStateTransition
+from bridgevla.hidden_state import A_psi, F_phi
 from PIL import Image
 
 
@@ -67,14 +65,10 @@ class MVT(nn.Module):
         load_pretrain=False,
         pretrain_path=None,
         paligemma_path="",
-        stage1_history_len=1,
-        stage1_adapter_bottleneck=128,
-        stage1_adapter_mode="auto",
-        stage1_loss_history_len=0,
-        stage1_temporal_loss_weight=0.0,
-        stage1_hidden_state_enabled=False,
-        stage1_hidden_state_dim=128,
-        stage1_hidden_state_action_dim=8,
+        hidden_state_enabled=False,
+        hidden_state_dim=128,
+        hidden_state_action_dim=8,
+        hidden_state_token_bottleneck=128,
     ):
         super().__init__()
         self.depth = depth
@@ -138,70 +132,30 @@ class MVT(nn.Module):
 
         # Hardcoded for vlm
         self.vlm_dim = 2048
-        self.stage1_history_len = int(stage1_history_len)
-        self.stage1_loss_history_len = int(stage1_loss_history_len)
-        self.stage1_temporal_loss_weight = float(stage1_temporal_loss_weight)
-        self.stage1_hidden_state_enabled = bool(stage1_hidden_state_enabled)
-        self.stage1_hidden_state_dim = int(stage1_hidden_state_dim)
-        self.stage1_hidden_state_action_dim = int(stage1_hidden_state_action_dim)
-        if self.stage1_history_len < 1:
-            raise ValueError("stage1_history_len must be >= 1")
-        if self.stage1_loss_history_len < 0:
-            raise ValueError("stage1_loss_history_len must be >= 0")
-        if self.stage1_temporal_loss_weight < 0:
-            raise ValueError("stage1_temporal_loss_weight must be >= 0")
-        if self.stage1_hidden_state_dim < 1:
-            raise ValueError("stage1_hidden_state_dim must be >= 1")
-        if self.stage1_hidden_state_action_dim < 1:
-            raise ValueError("stage1_hidden_state_action_dim must be >= 1")
+        self.hidden_state_enabled = bool(hidden_state_enabled)
+        self.hidden_state_dim = int(hidden_state_dim)
+        self.hidden_state_action_dim = int(hidden_state_action_dim)
+        self.hidden_state_token_bottleneck = int(hidden_state_token_bottleneck)
+        if self.hidden_state_dim < 1:
+            raise ValueError("hidden_state_dim must be >= 1")
+        if self.hidden_state_action_dim < 1:
+            raise ValueError("hidden_state_action_dim must be >= 1")
+        if self.hidden_state_token_bottleneck < 1:
+            raise ValueError("hidden_state_token_bottleneck must be >= 1")
 
-        requested_adapter_mode = str(stage1_adapter_mode)
-        if requested_adapter_mode == "auto":
-            # Checkpoints produced before the current route did not contain
-            # stage1_adapter_mode. Their history_len>1 identifies the legacy
-            # historical-fusion adapter and keeps those checkpoints loadable.
-            requested_adapter_mode = (
-                "legacy_temporal" if self.stage1_history_len > 1 else "current_correction"
-            )
-        if requested_adapter_mode not in {"current_correction", "legacy_temporal"}:
-            raise ValueError(
-                "stage1_adapter_mode must be 'current_correction', "
-                f"'legacy_temporal', or 'auto'; got {stage1_adapter_mode!r}"
-            )
-        self.stage1_adapter_mode = requested_adapter_mode
-        self.stage1_current_token_only = (
-            requested_adapter_mode == "current_correction"
-        )
-        if self.stage1_hidden_state_enabled and not self.stage1_current_token_only:
-            raise ValueError(
-                "stage1_hidden_state_enabled requires the current_correction adapter mode"
-            )
-
-        if self.stage1_current_token_only:
-            self.stage1_token_adapter = Stage1TokenCorrectionAdapter(
+        # Do not register new modules when the route is disabled. This keeps
+        # the original BridgeVLA checkpoint keys and default forward path
+        # unchanged.
+        if self.hidden_state_enabled:
+            self.A_psi = A_psi(
                 token_dim=self.vlm_dim,
-                bottleneck_dim=stage1_adapter_bottleneck,
-                hidden_state_dim=(
-                    self.stage1_hidden_state_dim
-                    if self.stage1_hidden_state_enabled
-                    else 0
-                ),
+                token_bottleneck_dim=self.hidden_state_token_bottleneck,
+                hidden_state_dim=self.hidden_state_dim,
             )
-        else:
-            self.stage1_token_adapter = Stage1TemporalTokenAdapter(
-                token_dim=self.vlm_dim,
-                bottleneck_dim=stage1_adapter_bottleneck,
-                max_history=self.stage1_history_len,
+            self.F_phi = F_phi(
+                hidden_dim=self.hidden_state_dim,
+                action_dim=self.hidden_state_action_dim,
             )
-
-        self.stage1_hidden_state_update = (
-            Stage1HiddenStateTransition(
-                hidden_dim=self.stage1_hidden_state_dim,
-                action_dim=self.stage1_hidden_state_action_dim,
-            )
-            if self.stage1_hidden_state_enabled
-            else None
-        )
 
         self.up0 = ConvexUpSample(
             in_dim=self.vlm_dim,
@@ -369,174 +323,79 @@ class MVT(nn.Module):
         rot_x_y=None,
         language_goal=None,
         forward_no_feat=False,
-        stage1_history_tokens=None,
-        stage1_history_mask=None,
-        stage1_token_window=None,
-        stage1_token_mask=None,
-        stage1_hidden_state=None,
-        return_stage1_tokens=False,
+        hidden_state_y=None,
         **kwargs,
     ):
         """
         :param img: tensor of shape (bs, num_img, img_feat_dim, h, w)
         :param img_aug: (float) magnitude of augmentation in rgb image
         :param rot_x_y: (bs, 2)
+        :param hidden_state_y: current episode hidden state, when enabled
         """
 
         bs, num_img, img_feat_dim, h, w = img.shape
         assert num_img == self.num_img
         assert h == w == self.img_size
-        if self.stage1_current_token_only and any(
-            value is not None
-            for value in (
-                stage1_history_tokens,
-                stage1_history_mask,
-                stage1_token_window,
-                stage1_token_mask,
+        if hidden_state_y is not None and not self.hidden_state_enabled:
+            raise ValueError(
+                "hidden_state_y was provided but the hidden-state route is disabled"
             )
+
+        # Only the RGB channels are passed to PaliGemma. The point-cloud
+        # renderer has already constructed the multi-view image tensor.
+        rgb_img = img[:, :, 3:6, :, :]
+        prompts = [text[0][0] for text in language_goal]
+        images = [
+            [MVT.trans_cuda_tensor_2_PIL(example) for example in examples]
+            for examples in rgb_img
+        ]
+        assert len(prompts) == len(images)
+        model_inputs = self.processor(
+            text=prompts,
+            images=images,
+            return_tensors="pt",
+            padding="longest",
+        )
+        model_inputs = model_inputs.to(self.model.dtype).to(self.model.device)
+
+        if self.hidden_state_enabled and all(
+            not p.requires_grad for p in self.model.parameters()
         ):
-            raise ValueError(
-                "current_correction mode accepts only the current token; "
-                "historical tokens must be used by the training loss"
-            )
-        if stage1_hidden_state is not None and not self.stage1_hidden_state_enabled:
-            raise ValueError(
-                "stage1_hidden_state was provided but the hidden-state route is disabled"
-            )
-        if stage1_hidden_state is not None and not self.stage1_current_token_only:
-            raise ValueError(
-                "stage1_hidden_state requires the current_correction adapter mode"
-            )
-
-        if stage1_token_window is None:
-            # Only the RGB channels are passed to PaliGemma. The point-cloud
-            # renderer has already constructed the multi-view image tensor.
-            rgb_img = img[:, :, 3:6, :, :]
-            prompts = [text[0][0] for text in language_goal]
-            images = [
-                [MVT.trans_cuda_tensor_2_PIL(example) for example in examples]
-                for examples in rgb_img
-            ]
-            assert len(prompts) == len(images)
-            model_inputs = self.processor(
-                text=prompts,
-                images=images,
-                return_tensors="pt",
-                padding="longest",
-            )
-            model_inputs = model_inputs.to(self.model.dtype).to(self.model.device)
-
-            if all(not p.requires_grad for p in self.model.parameters()):
-                with torch.no_grad():
-                    outputs = self.model(
-                        **model_inputs,
-                        output_hidden_states=True,
-                    )
-            else:
+            with torch.no_grad():
                 outputs = self.model(
                     **model_inputs,
                     output_hidden_states=True,
                 )
-
-            x = outputs.hidden_states[-1]
-            current_tokens = []
-
-            # Extract the visual tokens from the current PaliGemma output.
-            for i in range(bs):
-                current_ids = model_inputs["attention_mask"][i]
-                current_output = x[i]
-                non_zero_indices = torch.nonzero(
-                    current_ids != 0, as_tuple=True
-                )[0]
-                non_zero_output = current_output[non_zero_indices]
-                assert non_zero_output.shape[0] > 256 * self.num_img
-                current_tokens.append(non_zero_output[: 256 * self.num_img])
-            current_tokens = torch.stack(current_tokens)
         else:
-            # This path is retained only for archived checkpoints/configs.
-            if self.stage1_current_token_only:
-                raise ValueError(
-                    "stage1_token_window is not supported in current_correction mode"
-                )
-            token_window = stage1_token_window
-            if token_window.ndim == 3:
-                token_window = token_window.unsqueeze(1)
-            if token_window.ndim != 4:
-                raise ValueError(
-                    "stage1_token_window must have shape [B, K, S, D]"
-                )
-            token_window = token_window.to(device=img.device)
-            if (
-                token_window.shape[0] != bs
-                or token_window.shape[2] != 256 * self.num_img
-            ):
-                raise ValueError(
-                    "stage1_token_window has incompatible shape: "
-                    f"{tuple(token_window.shape)}"
-                )
-            token_mask = stage1_token_mask
-            current_tokens = token_window[:, -1]
+            outputs = self.model(
+                **model_inputs,
+                output_hidden_states=True,
+            )
 
-        if self.stage1_current_token_only:
-            # The active route keeps the current token sequence and optionally
-            # conditions its residual correction on a compact hidden state.
-            image_tokens = self.stage1_token_adapter(
+        x = outputs.hidden_states[-1]
+        current_tokens = []
+
+        # Extract the visual tokens from the current PaliGemma output.
+        for i in range(bs):
+            current_ids = model_inputs["attention_mask"][i]
+            current_output = x[i]
+            non_zero_indices = torch.nonzero(
+                current_ids != 0, as_tuple=True
+            )[0]
+            non_zero_output = current_output[non_zero_indices]
+            assert non_zero_output.shape[0] > 256 * self.num_img
+            current_tokens.append(non_zero_output[: 256 * self.num_img])
+        current_tokens = torch.stack(current_tokens)
+
+        if self.hidden_state_enabled:
+            image_tokens = self.A_psi(
                 current_tokens,
-                hidden_state=stage1_hidden_state,
+                hidden_state_y=hidden_state_y,
             )
         else:
-            if stage1_token_window is None and stage1_history_tokens is not None:
-                past_tokens = stage1_history_tokens
-                if past_tokens.ndim == 3:
-                    past_tokens = past_tokens.unsqueeze(1)
-                if past_tokens.ndim != 4:
-                    raise ValueError(
-                        "stage1_history_tokens must have shape [B, K-1, S, D]"
-                    )
-                past_tokens = past_tokens.to(
-                    device=current_tokens.device,
-                    dtype=current_tokens.dtype,
-                )
-                if (
-                    past_tokens.shape[0] != bs
-                    or past_tokens.shape[2:] != current_tokens.shape[1:]
-                ):
-                    raise ValueError(
-                        "stage1_history_tokens shape does not match current tokens: "
-                        f"past={tuple(past_tokens.shape)}, "
-                        f"current={tuple(current_tokens.shape)}"
-                    )
-                token_window = torch.cat(
-                    [past_tokens, current_tokens.unsqueeze(1)], dim=1
-                )
-                if stage1_history_mask is None:
-                    history_mask = torch.ones(
-                        bs,
-                        past_tokens.shape[1],
-                        dtype=torch.bool,
-                        device=current_tokens.device,
-                    )
-                else:
-                    history_mask = stage1_history_mask.to(
-                        device=current_tokens.device,
-                        dtype=torch.bool,
-                    )
-                token_mask = torch.cat(
-                    [
-                        history_mask,
-                        torch.ones(
-                            bs,
-                            1,
-                            dtype=torch.bool,
-                            device=current_tokens.device,
-                        ),
-                    ],
-                    dim=1,
-                )
-            elif stage1_token_window is None:
-                token_window = current_tokens.unsqueeze(1)
-                token_mask = None
-            image_tokens = self.stage1_token_adapter(token_window, token_mask)
+            # Keep the original BridgeVLA path byte-for-byte in spirit: no
+            # additional module or token transformation is used when disabled.
+            image_tokens = current_tokens
         x = rearrange(image_tokens, 'b (c h1 h2) w -> b w c h1 h2', c=self.num_img, h1=self.num_pat_img, h2=self.num_pat_img) 
         feat = []
         _feat = torch.max(torch.max(x, dim=-1)[0], dim=-1)[0]
@@ -632,15 +491,6 @@ class MVT(nn.Module):
             out = {}
 
         out.update({"trans": trans})
-        if return_stage1_tokens:
-            if self.stage1_current_token_only:
-                out["stage1_current_tokens"] = current_tokens.detach()
-                # Keep the correction graph available for the history-aware
-                # auxiliary loss in RVTAgent.update().
-                out["stage1_corrected_tokens"] = image_tokens
-            else:
-                out["stage1_tokens"] = current_tokens.detach()
-
         return out
 
 
@@ -684,21 +534,21 @@ class MVT(nn.Module):
         return pred_wpt
 
 
-    def initial_stage1_hidden_state(self, batch_size, device=None, dtype=None):
+    def initial_hidden_state(self, batch_size, device=None, dtype=None):
         """Return the zero hidden state for a new episode or sequence."""
-        if not self.stage1_hidden_state_enabled:
+        if not self.hidden_state_enabled:
             return None
-        return self.stage1_hidden_state_update.initial_state(
+        return self.F_phi.initial_hidden_state(
             batch_size=batch_size,
             device=device,
             dtype=dtype,
         )
 
-    def update_stage1_hidden_state(self, hidden_state, action):
-        """Apply the learned action-conditioned hidden-state transition."""
-        if not self.stage1_hidden_state_enabled:
-            return hidden_state
-        return self.stage1_hidden_state_update(hidden_state, action)
+    def update_hidden_state(self, hidden_state_y, action):
+        """Apply :math:`F_\\phi` after an executed waypoint."""
+        if not self.hidden_state_enabled:
+            return hidden_state_y
+        return self.F_phi(hidden_state_y, action)
 
     def free_mem(self):
         """

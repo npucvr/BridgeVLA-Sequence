@@ -2,7 +2,7 @@
 
 ## 1. 实验目的
 
-本实验评估 BridgeVLA 在 `current_correction` hidden-state 路由下，不同 optimizer updates checkpoint 的 RLBench 性能，并按照论文常用形式报告五轮独立完整评估的均值和样本标准差。
+本实验评估 BridgeVLA 在 hidden-state 路由下，不同 optimizer updates checkpoint 的 RLBench 性能，并按照论文常用形式报告五轮独立完整评估的均值和样本标准差。
 
 评估 checkpoint 为：100、250、500、1000 和 2000 optimizer updates。每个 checkpoint 均使用同一个训练 checkpoint，进行五轮独立完整 EVAL。
 
@@ -15,7 +15,7 @@
 - 每个 episode 最大步数：25
 - 每个 checkpoint 五轮总 episode 数：2250
 - `start_episode=0`
-- 评估路由：`stage1_hidden_state_enabled=True`、`stage1_adapter_mode=current_correction`
+- 评估路由：`hidden_state_enabled=True`
 - hidden-state checkpoint 的 `run_1` 使用此前已完成的 full EVAL，`run_2`–`run_5` 为本实验追加的四轮评估
 
 对每轮先计算 18 个 task success rate 的平均值，再在五个 run-level 平均值上计算：
@@ -83,6 +83,6 @@ $$
 
 ## 7. 数据与复核
 
-- 完整结构化结果（包括每轮结果、逐 task mean/std、variance 和原始 CSV 路径）：[`data/stage1_hidden_state_runs/five_run_summary.json`](../data/stage1_hidden_state_runs/five_run_summary.json)
-- 简版论文式结果表：[`data/stage1_hidden_state_runs/five_run_paper_report.md`](../data/stage1_hidden_state_runs/five_run_paper_report.md)
+- 完整结构化结果（包括每轮结果、逐 task mean/std、variance 和原始 CSV 路径）：[`data/hidden_state_runs/five_run_summary.json`](../data/hidden_state_runs/five_run_summary.json)
+- 简版论文式结果表：[`data/hidden_state_runs/five_run_paper_report.md`](../data/hidden_state_runs/five_run_paper_report.md)
 - 共验证 25 个 CSV，每个包含 18 个 task 行；20 个新增评估日志均包含 18 个 `[Evaluation] Finished` 标记并以 `exit=0` 结束。

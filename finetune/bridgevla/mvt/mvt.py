@@ -63,14 +63,10 @@ class MVT(nn.Module):
         load_pretrain=False,
         pretrain_path=None,
         paligemma_path="",
-        stage1_history_len=1,
-        stage1_adapter_bottleneck=128,
-        stage1_adapter_mode="auto",
-        stage1_loss_history_len=0,
-        stage1_temporal_loss_weight=0.0,
-        stage1_hidden_state_enabled=False,
-        stage1_hidden_state_dim=128,
-        stage1_hidden_state_action_dim=8,
+        hidden_state_enabled=False,
+        hidden_state_dim=128,
+        hidden_state_action_dim=8,
+        hidden_state_token_bottleneck=128,
     ):
         super().__init__()
 
@@ -115,17 +111,17 @@ class MVT(nn.Module):
 
 
 
-    def initial_stage1_hidden_state(self, batch_size, device=None, dtype=None):
-        """Return a zero hidden state for the active Stage-1 route."""
-        return self.mvt1.initial_stage1_hidden_state(
+    def initial_hidden_state(self, batch_size, device=None, dtype=None):
+        """Return a zero hidden state for a new episode or sequence."""
+        return self.mvt1.initial_hidden_state(
             batch_size=batch_size,
             device=device,
             dtype=dtype,
         )
 
-    def update_stage1_hidden_state(self, hidden_state, action):
-        """Update Stage-1 hidden state after one executed waypoint."""
-        return self.mvt1.update_stage1_hidden_state(hidden_state, action)
+    def update_hidden_state(self, hidden_state_y, action):
+        """Update the hidden state after an executed waypoint."""
+        return self.mvt1.update_hidden_state(hidden_state_y, action)
 
     def get_pt_loc_on_img(self, pt, mvt1_or_mvt2, dyn_cam_info, out=None):
         """
@@ -322,7 +318,7 @@ class MVT(nn.Module):
         wpt_local=None,
         rot_x_y=None,
         language_goal=None,
-        stage1_hidden_state=None,
+        hidden_state_y=None,
         **kwargs,
     ):
         """
@@ -336,6 +332,7 @@ class MVT(nn.Module):
             (bs, 3)
         :param rot_x_y: (bs, 2) rotation in x and y direction
         :param language_goal: str (bs,)language instruction
+        :param hidden_state_y: current episode hidden state, when enabled
         """
         self.verify_inp(
             pc=pc,
@@ -365,30 +362,11 @@ class MVT(nn.Module):
         else:
             wpt_local_stage_one = wpt_local
 
-        # Stage-1-only keyword arguments belong to the first MVT pass. The
-        # current correction route accepts only the current token; the legacy
-        # temporal-fusion mode handles the historical arguments itself.
-        stage1_kwarg_names = {
-            "stage1_history_tokens",
-            "stage1_history_mask",
-            "stage1_token_window",
-            "stage1_token_mask",
-            "stage1_hidden_state",
-            "return_stage1_tokens",
-        }
-        stage1_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key in stage1_kwarg_names
-        }
-        if stage1_hidden_state is not None:
-            stage1_kwargs["stage1_hidden_state"] = stage1_hidden_state
-        mvt2_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key not in stage1_kwarg_names
-        }
-
+        # The hidden state belongs only to the first MVT pass. Stage-two uses
+        # the original BridgeVLA call path and receives no hidden state.
+        mvt1_kwargs = dict(kwargs)
+        mvt1_kwargs["hidden_state_y"] = hidden_state_y
+        mvt2_kwargs = dict(kwargs)
         out = self.mvt1(
             img=img,
             wpt_local=wpt_local_stage_one,
@@ -396,7 +374,7 @@ class MVT(nn.Module):
             language_goal=language_goal,
             forward_no_feat=True,
             # forward_no_feat=False,
-            **stage1_kwargs,
+            **mvt1_kwargs,
         )
         out["mvt1_ori_img"]=img.clone().detach()
         def visualize_tensor(tensor, save_path=None):

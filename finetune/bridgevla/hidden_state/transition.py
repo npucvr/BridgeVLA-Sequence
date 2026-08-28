@@ -1,13 +1,13 @@
-"""Lightweight action-conditioned hidden-state transition for Stage-1."""
+"""The hidden-state transition module :math:`F_\\phi(y_t, u_t)`."""
 
 import torch
 from torch import nn
 
 
-class Stage1HiddenStateTransition(nn.Module):
-    """Update a compact policy hidden state after one waypoint action.
+class F_phi(nn.Module):
+    """Update the policy hidden state after one waypoint action.
 
-    The state is an episode-local runtime value.  The module parameters are
+    The state is an episode-local runtime value. The module parameters are
     shared across decision steps and are trained through the downstream action
     loss when a sequence is unrolled.
     """
@@ -28,7 +28,7 @@ class Stage1HiddenStateTransition(nn.Module):
         )
         self.transition = nn.GRUCell(self.hidden_dim, self.hidden_dim)
 
-    def initial_state(self, batch_size, device=None, dtype=None):
+    def initial_hidden_state(self, batch_size, device=None, dtype=None):
         """Return the zero state used at the beginning of an episode."""
         if batch_size < 1:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
@@ -40,11 +40,11 @@ class Stage1HiddenStateTransition(nn.Module):
             dtype=dtype if dtype is not None else parameter.dtype,
         )
 
-    def forward(self, hidden_state, action):
+    def forward(self, hidden_state_y, action):
         """Return the next state for ``action``.
 
         Args:
-            hidden_state: ``[B, hidden_dim]`` or ``None`` for a zero state.
+            hidden_state_y: ``[B, hidden_dim]`` or ``None`` for a zero state.
             action: ``[B, action_dim]`` waypoint action.
         """
         if action.ndim != 2:
@@ -59,24 +59,25 @@ class Stage1HiddenStateTransition(nn.Module):
 
         parameter = next(self.parameters())
         action = action.to(device=parameter.device, dtype=parameter.dtype)
-        if hidden_state is None:
-            hidden_state = self.initial_state(
+        if hidden_state_y is None:
+            hidden_state_y = self.initial_hidden_state(
                 action.shape[0], device=parameter.device, dtype=parameter.dtype
             )
         else:
-            if hidden_state.ndim != 2:
+            if hidden_state_y.ndim != 2:
                 raise ValueError(
-                    "hidden_state must have shape [B, hidden_dim], "
-                    f"got {tuple(hidden_state.shape)}"
+                    "hidden_state_y must have shape [B, hidden_dim], "
+                    f"got {tuple(hidden_state_y.shape)}"
                 )
-            if hidden_state.shape != (action.shape[0], self.hidden_dim):
+            if hidden_state_y.shape != (action.shape[0], self.hidden_dim):
                 raise ValueError(
-                    "hidden_state shape does not match action: "
-                    f"hidden={tuple(hidden_state.shape)}, action={tuple(action.shape)}"
+                    "hidden_state_y shape does not match action: "
+                    f"hidden={tuple(hidden_state_y.shape)}, "
+                    f"action={tuple(action.shape)}"
                 )
-            hidden_state = hidden_state.to(
+            hidden_state_y = hidden_state_y.to(
                 device=parameter.device, dtype=parameter.dtype
             )
 
         action_embedding = self.action_encoder(action)
-        return self.transition(action_embedding, hidden_state)
+        return self.transition(action_embedding, hidden_state_y)

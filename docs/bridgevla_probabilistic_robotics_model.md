@@ -123,11 +123,13 @@ $$
 
 ## 轻量验证实现
 
-当前代码提供一个显式开关 `stage1_hidden_state_enabled`，默认关闭以保持旧 checkpoint 的行为；快速验证时打开该开关，并保持 `stage1_adapter_mode="current_correction"`。RLBench 训练入口可使用 `--mvt_cfg_opts "stage1_hidden_state_enabled True stage1_adapter_mode current_correction"`。实现只新增两个小模块：
+当前代码提供一个显式开关 `hidden_state_enabled`，默认关闭以保持原始 checkpoint 的结构和行为；快速验证时可使用 `--mvt_cfg_opts "hidden_state_enabled True"`。实现只新增两个小模块：
 
-1. `Stage1TokenCorrectionAdapter` 使用 token bottleneck，并把 $y_{t_o}$ 投影到同一个 bottleneck 后广播到各个 token；输出层零初始化，因此初始输出仍等于 $H_{t_o}$。
-2. `Stage1HiddenStateTransition` 使用 action encoder 和紧凑的 `GRUCell` 实现 $F_\phi(y_{t_o},\hat u_{t_o\to t_g})$。
+1. `finetune/bridgevla/hidden_state/token_correction.py` 中的 `A_psi` 使用 token bottleneck，并把 $y_{t_o}$ 投影到同一个 bottleneck 后广播到各个 token；输出层零初始化，因此初始输出仍等于 $H_{t_o}$。
+2. `finetune/bridgevla/hidden_state/transition.py` 中的 `F_phi` 使用 action encoder 和紧凑的 `GRUCell` 实现 $F_\phi(y_{t_o},\hat u_{t_o\to t_g})$。
 
 在线 rollout 中，episode 开始时通过 `reset()` 清空 $y$；第一次 `act()` 使用零初值；产生的 waypoint 在环境执行完成后，于下一次 `act()` 开始前更新 $y$。这样不会把尚未执行的动作反馈给当前决策，也不会在 `stage_two` 的两次 MVT forward 中重复更新。
 
-当前 replay buffer 仍然独立采样单个 transition。因而普通单步行为克隆可以快速验证 token correction 的形状、初始化和 action loss 路径，但只有按时间顺序展开至少两个决策，第二个决策的行为克隆损失才会为 $F_\phi$ 提供梯度。现阶段的快速检查包含一个两步合成展开；真实序列训练应在该检查通过后再接入。
+当前 replay buffer 仍然独立采样单个 transition。因而普通单步行为克隆可以快速验证 token correction 的形状、初始化和 action loss 路径，但只有按时间顺序展开至少两个决策，第二个决策的行为克隆损失才会为 $F_\phi$ 提供梯度。真实序列训练应在该检查通过后再接入。
+
+历史 token-window、cache 和辅助损失 checkpoint 不再属于当前接口；需要从原始 BridgeVLA checkpoint 开启 `hidden_state_enabled` 后重新训练。关闭该开关时仍保持原始 checkpoint 的严格加载兼容性。
