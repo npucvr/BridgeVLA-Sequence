@@ -95,7 +95,51 @@ $$
 
 下面将 $t-1$、$t$ 和 $t+1$ 展开为数据节点。$x$ 由环境维护，$z$ 是每个时刻新产生的观测，$y$ 是模型维护的隐状态，$u$ 是连接策略和环境的动作反馈。
 
-运行时，实际观测 $z_t$ 先经 PaliGemma 形成 $H_t$，再由 $H_t$ 同时参与 token 修正和 hidden-state update；策略融合修正后的 tokens 与 $y_t$ 后输出 $u_t$。其中 $F_\phi$、$U_\omega$ 和 $A_\psi$ 是内部运算，$x_t$、$z_t$、$H_t$、$y_t$ 和 $u_t$ 是随时间展开的数据节点。本文不规定 $U_\omega$ 对 $H_t$ 的具体降维或注意力方式。observation decoder 仅用于训练辅助，不放入主控制路径。
+```mermaid
+graph LR
+    subgraph Tprev["时刻 t-1"]
+        Xprev["真实状态 x_prev"]
+        Yprev["持久隐状态 y_prev"]
+        Uprev["上一动作 u_prev"]
+    end
+
+    subgraph T["时刻 t"]
+        X["真实状态 x_t"]
+        Z["实际观测 z_t"]
+        G["PaliGemma 编码器"]
+        H["视觉 tokens H_t"]
+        YPred["预测隐状态 y_pred"]
+        Y["校正隐状态 y_t"]
+        P["BridgeVLA 策略"]
+        U["当前动作 u_t"]
+    end
+
+    subgraph Tnext["时刻 t+1"]
+        Xnext["真实状态 x_next"]
+        YPredNext["预测隐状态 y_next_pred"]
+    end
+
+    Xprev -->|环境状态转移| X
+    Uprev -->|控制输入| X
+    X -->|观测过程| Z
+    Yprev -->|历史隐状态| YPred
+    Uprev -->|动作条件| YPred
+
+    Z -->|当前观测| G
+    G -->|编码输出| H
+    H -->|观测更新输入| Y
+    YPred -->|预测状态输入| Y
+    H -->|Token 修正| P
+    Y -->|隐状态条件| P
+    P -->|策略输出| U
+
+    X -->|环境状态转移| Xnext
+    U -->|控制输入| Xnext
+    Y -->|历史隐状态| YPredNext
+    U -->|动作条件| YPredNext
+```
+
+图中明确区分了两条路径：实际观测 $z_t$ 先经 PaliGemma 形成 $H_t$，再由 $H_t$ 同时参与 token 修正和 hidden-state update；策略融合修正后的 tokens 与 $y_t$ 后输出 $u_t$。其中 $F_\phi$、$U_\omega$ 和 $A_\psi$ 是箭头上的运算，$x_t$、$z_t$、$H_t$、$y_t$ 和 $u_t$ 是随时间展开的数据节点。本文不规定 $U_\omega$ 对 $H_t$ 的具体降维或注意力方式。observation decoder 仅用于训练辅助，不放入主控制路径。
 
 观测 decoder 近似预测 belief 经过环境观测模型后的分布：
 
