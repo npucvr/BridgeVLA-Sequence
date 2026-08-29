@@ -1,24 +1,51 @@
-# BridgeVLA hidden-state 五轮完整评估报告
+# BridgeVLA H-token sequence 路线五轮完整 RLBench 实验报告
 
 ## 1. 实验目的
 
-本实验评估 BridgeVLA 在 hidden-state 路由下，不同 optimizer updates checkpoint 的 RLBench 性能，并按照论文常用形式报告五轮独立完整评估的均值和样本标准差。
+本实验评估新的 H-token hidden-state sequence 路线是否能在 BridgeVLA 上带来性能或稳定性提升，并使用与官方 baseline 相同的完整 RLBench 评测协议进行比较。
 
-评估 checkpoint 为：100、250、500、1000 和 2000 optimizer updates。每个 checkpoint 均使用同一个训练 checkpoint，进行五轮独立完整 EVAL。
+H-token 路线的核心形式为：
 
-## 2. 评估协议
+$$
+H_t = \operatorname{PaliGemma}(z_t, l),
+\qquad
+y_t^- = F_\phi(y_{t-1}, u_{t-1}),
+$$
+
+$$
+y_t = U_\omega(y_t^-, H_t),
+\qquad
+\widetilde{H}_t = H_t + A_\psi(H_t, y_t).
+$$
+
+## 2. 训练与评测协议
+
+### 2.1 训练
 
 - Benchmark：RLBench
+- Tasks：18
+- Demonstrations：每个 task 100 条
+- 初始化 checkpoint：`data/bridgevla_ckpt/bridgevla/rlbench/model_80.pth`
+- 训练方式：route-only，冻结 BridgeVLA 主体，仅训练新的 hidden-state route 模块
+- Sequence window：4
+- Batch size：4
+- Epoch：1
+- Optimizer updates：100、250、500、1000、2000
+- 对应 `train_iter`：400、1000、2000、4000、8000
+- 所有训练运行退出码：0
+
+### 2.2 官方完整评测
+
 - Tasks：18
 - 每个 task 每轮 episode 数：25
 - 每轮 episode 总数：450
 - 每个 episode 最大步数：25
-- 每个 checkpoint 五轮总 episode 数：2250
+- 每个 checkpoint 的独立运行数：5
+- 每个 checkpoint 总 episode 数：2250
 - `start_episode=0`
-- 评估路由：`hidden_state_enabled=True`
-- hidden-state checkpoint 的 `run_1` 使用此前已完成的 full EVAL，`run_2`–`run_5` 为本实验追加的四轮评估
+- 每轮先计算 18 个 task success rate 的算术平均，再对 5 个 run-level 平均值取均值
 
-对每轮先计算 18 个 task success rate 的平均值，再在五个 run-level 平均值上计算：
+记第 $i$ 次运行的 18-task 平均成功率为 $s_i$，报告指标为：
 
 $$
 \bar{s}=\frac{1}{5}\sum_{i=1}^{5}s_i,
@@ -27,62 +54,80 @@ $$
 =\sqrt{\frac{1}{4}\sum_{i=1}^{5}(s_i-\bar{s})^2}.
 $$
 
-因此，报告中的标准差是五轮重复评估的 **sample standard deviation（`ddof=1`）**。
+因此标准差为五次独立运行的 sample standard deviation（`ddof=1`）。由于每个 task 均为 25 episodes，task mean 与所有 episode 的 pooled success rate 等价。
 
-## 3. 整体结果
+H-token checkpoint 的第 1 次运行复用此前已经完成的完整评测，第 2–5 次为追加评测；官方 baseline 则重新完成了 5 次独立完整评测。
 
-| checkpoint | run_1 | run_2 | run_3 | run_4 | run_5 | Success（mean ± std） | 相对官方 baseline |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| Official baseline | 88.22% | 87.11% | 89.33% | 88.89% | 88.44% | **88.40 ± 0.84%** | — |
-| 100 updates | 89.11% | 86.67% | 88.00% | 87.56% | 87.11% | **87.69 ± 0.94%** | -0.71 pp |
-| 250 updates | 85.78% | 86.22% | 87.78% | 86.44% | 86.89% | **86.62 ± 0.76%** | -1.78 pp |
-| 500 updates | 85.11% | 86.67% | 86.44% | 86.67% | 85.78% | **86.13 ± 0.68%** | -2.27 pp |
-| 1000 updates | 86.22% | 86.00% | 87.56% | 86.22% | 88.00% | **86.80 ± 0.91%** | -1.60 pp |
-| 2000 updates | 86.67% | 87.78% | 89.33% | 88.00% | 85.78% | **87.51 ± 1.36%** | -0.89 pp |
+## 3. 训练 checkpoint
 
-其中 `pp` 表示 percentage points。
+| Optimizer updates | `train_iter` | Checkpoint |
+|---:|---:|---|
+| 100 | 400 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%20400%20num_workers%201_hidden_state_enabled%20True/sequence_full_100/debug/08_28_18_10/model_last.pth) |
+| 250 | 1000 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%201000%20num_workers%201_hidden_state_enabled%20True/sequence_full_250/debug/08_28_18_10/model_last.pth) |
+| 500 | 2000 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%202000%20num_workers%201_hidden_state_enabled%20True/sequence_full_500/debug/08_28_18_10/model_last.pth) |
+| 1000 | 4000 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%204000%20num_workers%201_hidden_state_enabled%20True/sequence_full_1000/debug/08_28_18_10/model_last.pth) |
+| 2000 | 8000 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%208000%20num_workers%201_hidden_state_enabled%20True/sequence_full_2000/debug/08_28_18_36/model_last.pth) |
 
-## 4. 逐任务五轮统计
+## 4. 五轮整体结果
 
-下表为每个 hidden-state checkpoint 在五轮评估上的逐 task success rate，格式为 `mean ± sample std`。
+`Success` 为五次 run-level task mean 的均值；括号内为运行间 sample standard deviation。`Δ` 相对同一官方 baseline 五轮均值，单位为 percentage points（pp）。
 
-| Task | 100 updates | 250 updates | 500 updates | 1000 updates | 2000 updates |
-|---|---:|---:|---:|---:|---:|
-| `close_jar` | 100.00 ± 0.00% | 100.00 ± 0.00% | 100.00 ± 0.00% | 100.00 ± 0.00% | 100.00 ± 0.00% |
-| `reach_and_drag` | 100.00 ± 0.00% | 100.00 ± 0.00% | 100.00 ± 0.00% | 100.00 ± 0.00% | 98.40 ± 3.58% |
-| `insert_onto_square_peg` | 92.00 ± 4.00% | 88.80 ± 5.22% | 89.60 ± 2.19% | 88.80 ± 5.22% | 91.20 ± 3.35% |
-| `meat_off_grill` | 100.00 ± 0.00% | 99.20 ± 1.79% | 100.00 ± 0.00% | 100.00 ± 0.00% | 100.00 ± 0.00% |
-| `open_drawer` | 99.20 ± 1.79% | 99.20 ± 1.79% | 100.00 ± 0.00% | 97.60 ± 3.58% | 99.20 ± 1.79% |
-| `place_cups` | 58.40 ± 5.37% | 50.40 ± 8.29% | 50.40 ± 4.56% | 52.00 ± 7.48% | 56.80 ± 7.16% |
-| `place_wine_at_rack_location` | 90.40 ± 7.80% | 92.80 ± 6.57% | 87.20 ± 5.22% | 88.00 ± 4.90% | 93.60 ± 2.19% |
-| `push_buttons` | 99.20 ± 1.79% | 98.40 ± 2.19% | 98.40 ± 2.19% | 100.00 ± 0.00% | 99.20 ± 1.79% |
-| `put_groceries_in_cupboard` | 75.20 ± 3.35% | 76.80 ± 3.35% | 76.80 ± 3.35% | 75.20 ± 3.35% | 77.60 ± 4.56% |
-| `put_item_in_drawer` | 98.40 ± 2.19% | 96.00 ± 2.83% | 99.20 ± 1.79% | 92.00 ± 9.38% | 94.40 ± 2.19% |
-| `put_money_in_safe` | 100.00 ± 0.00% | 100.00 ± 0.00% | 100.00 ± 0.00% | 100.00 ± 0.00% | 100.00 ± 0.00% |
-| `light_bulb_in` | 87.20 ± 5.93% | 86.40 ± 4.56% | 84.00 ± 4.00% | 85.60 ± 4.56% | 90.40 ± 2.19% |
-| `slide_block_to_color_target` | 96.80 ± 3.35% | 92.80 ± 4.38% | 96.00 ± 4.00% | 96.00 ± 4.00% | 93.60 ± 2.19% |
-| `place_shape_in_shape_sorter` | 53.60 ± 4.56% | 59.20 ± 3.35% | 52.80 ± 1.79% | 56.00 ± 4.00% | 59.20 ± 9.55% |
-| `stack_blocks` | 76.80 ± 5.22% | 76.80 ± 3.35% | 75.20 ± 5.22% | 75.20 ± 5.22% | 72.00 ± 11.31% |
-| `stack_cups` | 77.60 ± 6.69% | 76.80 ± 5.93% | 80.80 ± 7.16% | 82.40 ± 6.69% | 80.80 ± 5.22% |
-| `sweep_to_dustpan_of_size` | 85.60 ± 2.19% | 79.20 ± 3.35% | 74.40 ± 2.19% | 86.40 ± 2.19% | 80.00 ± 4.00% |
-| `turn_tap` | 88.00 ± 4.90% | 86.40 ± 6.07% | 85.60 ± 6.69% | 87.20 ± 5.22% | 88.80 ± 3.35% |
+| 配置 | run_1 | run_2 | run_3 | run_4 | run_5 | Success（mean ± std） | 成功 episodes | Δ mean | Δ std |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Official baseline | 87.33% | 85.11% | 89.56% | 87.78% | 87.11% | **87.38 ± 1.59%** | 1966/2250 | — | — |
+| H-token，100 updates | 87.11% | 87.78% | 85.11% | 88.44% | 86.22% | **86.93 ± 1.31%** | 1956/2250 | -0.44 | -0.28 |
+| H-token，250 updates | 89.11% | 87.56% | 87.56% | 88.44% | 86.89% | **87.91 ± 0.87%** | 1978/2250 | +0.53 | -0.72 |
+| H-token，500 updates | 88.22% | 87.33% | 87.33% | 88.00% | 86.22% | **87.42 ± 0.78%** | 1967/2250 | +0.04 | -0.81 |
+| H-token，1000 updates | 89.11% | 90.00% | 89.56% | 86.67% | 85.56% | **88.18 ± 1.95%** | 1984/2250 | +0.80 | +0.36 |
+| H-token，2000 updates | 85.33% | 87.78% | 86.67% | 87.78% | 87.33% | **86.98 ± 1.03%** | 1957/2250 | -0.40 | -0.56 |
 
-## 5. 结果分析
+## 5. 逐任务五轮统计
 
-1. 在本实验配置下，训练长度没有带来单调的性能提升。
-2. 100 updates 的整体均值最高，为 `87.69 ± 0.94%`，但仍低于官方 baseline 的 `88.40 ± 0.84%`。
-3. 500 updates 的均值最低，为 `86.13 ± 0.68%`。
-4. 2000 updates 相比 250 和 500 updates 有所恢复，但仍低于官方 baseline，且重复评估波动最大（`±1.36%`）。
-5. `place_cups`、`place_shape_in_shape_sorter` 和 `stack_blocks` 是整体性能较低或波动较大的任务，应作为后续诊断重点。
+下表为五次运行的逐 task success rate，格式为 `mean ± sample std`，单位为百分比。
 
-## 6. 限定与解释
+| Task | Official baseline | H-token 100 | H-token 250 | H-token 500 | H-token 1000 | H-token 2000 |
+|---|---:|---:|---:|---:|---:|---:|
+| `close_jar` | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 |
+| `reach_and_drag` | 100.00 ± 0.00 | 99.20 ± 1.79 | 100.00 ± 0.00 | 100.00 ± 0.00 | 99.20 ± 1.79 | 98.40 ± 2.19 |
+| `insert_onto_square_peg` | 88.80 ± 3.35 | 88.00 ± 4.90 | 92.00 ± 5.66 | 90.40 ± 6.07 | 91.20 ± 3.35 | 88.00 ± 4.90 |
+| `meat_off_grill` | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 |
+| `open_drawer` | 100.00 ± 0.00 | 97.60 ± 3.58 | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 | 99.20 ± 1.79 |
+| `place_cups` | 52.00 ± 6.32 | 49.60 ± 14.03 | 52.80 ± 5.22 | 49.60 ± 8.29 | 60.80 ± 15.07 | 50.40 ± 14.59 |
+| `place_wine_at_rack_location` | 88.00 ± 8.49 | 88.00 ± 8.94 | 88.00 ± 7.48 | 90.40 ± 6.69 | 85.60 ± 10.43 | 88.80 ± 7.69 |
+| `push_buttons` | 100.00 ± 0.00 | 97.60 ± 2.19 | 100.00 ± 0.00 | 97.60 ± 2.19 | 99.20 ± 1.79 | 100.00 ± 0.00 |
+| `put_groceries_in_cupboard` | 77.60 ± 3.58 | 77.60 ± 3.58 | 79.20 ± 5.22 | 75.20 ± 3.35 | 78.40 ± 6.69 | 76.80 ± 4.38 |
+| `put_item_in_drawer` | 98.40 ± 3.58 | 92.80 ± 6.57 | 95.20 ± 1.79 | 93.60 ± 2.19 | 97.60 ± 2.19 | 97.60 ± 2.19 |
+| `put_money_in_safe` | 100.00 ± 0.00 | 100.00 ± 0.00 | 100.00 ± 0.00 | 99.20 ± 1.79 | 100.00 ± 0.00 | 100.00 ± 0.00 |
+| `light_bulb_in` | 81.60 ± 7.27 | 90.40 ± 3.58 | 91.20 ± 5.93 | 90.40 ± 3.58 | 86.40 ± 3.58 | 89.60 ± 5.37 |
+| `slide_block_to_color_target` | 97.60 ± 5.37 | 97.60 ± 2.19 | 96.80 ± 3.35 | 94.40 ± 6.07 | 96.80 ± 3.35 | 97.60 ± 2.19 |
+| `place_shape_in_shape_sorter` | 56.80 ± 3.35 | 62.40 ± 6.07 | 60.80 ± 7.69 | 61.60 ± 6.07 | 60.80 ± 7.16 | 52.80 ± 5.22 |
+| `stack_blocks` | 77.60 ± 8.29 | 76.00 ± 8.49 | 75.20 ± 6.57 | 71.20 ± 7.16 | 75.20 ± 7.16 | 75.20 ± 6.57 |
+| `stack_cups` | 78.40 ± 6.07 | 80.80 ± 1.79 | 80.00 ± 4.00 | 85.60 ± 2.19 | 81.60 ± 5.37 | 75.20 ± 8.67 |
+| `sweep_to_dustpan_of_size` | 85.60 ± 2.19 | 76.80 ± 4.38 | 76.00 ± 4.00 | 81.60 ± 4.56 | 82.40 ± 3.58 | 84.00 ± 2.83 |
+| `turn_tap` | 90.40 ± 7.27 | 90.40 ± 2.19 | 95.20 ± 3.35 | 92.80 ± 3.35 | 92.00 ± 4.90 | 92.00 ± 2.83 |
 
-- 这里的标准差反映同一个训练 checkpoint 的重复评估波动，不是不同训练 seed 之间的方差。
-- 当前 replay sampler 提供独立 transition，没有按 episode 形成真实时序样本，因此不能据此证明 `F_phi` 获得了真实 sequence-training 梯度。
-- hidden state 是任务相关的内部表示，不等同于真实环境状态。
+## 6. 结果分析
 
-## 7. 数据与复核
+1. 官方 baseline 五轮平均为 **87.38 ± 1.59%**。
+2. H-token 的最高平均值是 1000 updates 的 **88.18%**，相对 baseline 仅 **+0.80 pp**，但标准差升至 **1.95 pp**。
+3. 100、250、500 和 2000 updates 的运行间标准差分别为 1.31、0.87、0.78 和 1.03 pp；只有在部分训练长度下低于 baseline，不能说明整体稳定性提升。
+4. 训练长度与性能没有单调关系；2000 updates 的平均值降至 86.98%。
+5. H-token 在 `light_bulb_in`、`place_shape_in_shape_sorter` 和部分 `turn_tap` 任务上有一定改善，但 `place_cups`、`stack_blocks` 和 `sweep_to_dustpan_of_size` 仍是主要瓶颈，且部分任务运行间波动较大。
+6. 因此，在当前训练数据、sequence window 和 route-only 配置下，不能认定 H-token sequence 路线带来了可靠的性能或稳定性增益。
 
-- 完整结构化结果（包括每轮结果、逐 task mean/std、variance 和原始 CSV 路径）：[`data/hidden_state_runs/five_run_summary.json`](../data/hidden_state_runs/five_run_summary.json)
-- 简版论文式结果表：[`data/hidden_state_runs/five_run_paper_report.md`](../data/hidden_state_runs/five_run_paper_report.md)
-- 共验证 25 个 CSV，每个包含 18 个 task 行；20 个新增评估日志均包含 18 个 `[Evaluation] Finished` 标记并以 `exit=0` 结束。
+## 7. 结论与限定
+
+当前最准确的实验结论是：**新的 H-token sequence 方案没有显示出稳定、可确认的性能提升，也没有整体降低运行间标准差。** 1000 updates 的小幅均值提升伴随更大的波动，应视为实验方差范围内的结果，而不是确定性增益。
+
+这里的标准差反映同一个训练 checkpoint 的五次重复评估波动，不是不同训练 seed 之间的方差。当前 sequence sampler 使用长度为 4 的时间窗口；hidden-state prior 与真实环境状态也不是同一概念。
+
+## 8. 数据、日志与复核
+
+- H-token 五轮正式汇总：[`data/hidden_state_sequence_eval_repeats_v1/summary_official_5run.json`](../data/hidden_state_sequence_eval_repeats_v1/summary_official_5run.json)
+- 官方 baseline 五轮正式汇总：[`data/official_baseline_eval_5runs_v1/summary_official_5run.json`](../data/official_baseline_eval_5runs_v1/summary_official_5run.json)
+- H-token 评测日志：[`data/hidden_state_sequence_eval_repeats_v1/`](../data/hidden_state_sequence_eval_repeats_v1/)
+- baseline 评测日志：[`data/official_baseline_eval_5runs_v1/`](../data/official_baseline_eval_5runs_v1/)
+- H-token 训练日志：[`data/hidden_state_sequence_full_v2/`](../data/hidden_state_sequence_full_v2/)
+- 旧的 H-token 单次结果汇总（仅作历史记录）：[`data/hidden_state_sequence_eval_v3/summary.json`](../data/hidden_state_sequence_eval_v3/summary.json)
+
+共核验 30 个完整评测 CSV（5 个 H-token checkpoint × 5 次运行 + baseline × 5 次运行），每个 CSV 均包含 18 个 task 行，全部评测退出码为 0。聚焦路线测试 [`tests/test_stage2_hidden_state_route.py`](../tests/test_stage2_hidden_state_route.py) 和相关 Python 语法检查均通过。
