@@ -21,6 +21,7 @@ MODEL_FOLDER="${MODEL_FOLDER:-$REPO_ROOT/data/bridgevla_ckpt/bridgevla/rlbench}"
 # The released TRAIN_DATA contains the 100 training demonstrations.  The
 # paper evaluates on the separate held-out EVAL_DATA split (25 episodes).
 EVAL_DATAFOLDER="${EVAL_DATAFOLDER:-$REPO_ROOT/data/RLBench_EVAL_DATA}"
+EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-$REPO_ROOT/outputs}"
 RESULT_LOG_DIR="${RESULT_LOG_DIR:-rlbench_repro}"
 LOG_NAME="${LOG_NAME:-$RESULT_LOG_DIR/run_${RUN_ID}}"
 
@@ -48,6 +49,7 @@ python eval.py \
   --eval-episodes "$EVAL_EPISODES" \
   --episode-length "$EPISODE_LENGTH" \
   --log-name "$LOG_NAME" \
+  --eval-output-root "$EVAL_OUTPUT_ROOT" \
   --device "$GPU_ID" \
   --headless \
   --model-name model_80.pth

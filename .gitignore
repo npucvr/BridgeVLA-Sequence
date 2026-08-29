@@ -21,6 +21,9 @@ finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
 finetune/bridgevla/libs/PyRep/
 finetune/bridgevla/libs/RLBench/
 
+# ===== Project experiment outputs (kept outside data inputs) =====
+/outputs/
+
 # ===== Training outputs / logs =====
 finetune/RLBench/train/
 finetune/RLBench/wandb/

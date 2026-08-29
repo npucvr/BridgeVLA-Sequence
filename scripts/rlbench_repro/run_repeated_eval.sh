@@ -12,14 +12,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
-LOG_DIR="${LOG_DIR:-/tmp/bridgevla_rlbench_repeated_logs}"
+LOG_DIR="${LOG_DIR:-$REPO_ROOT/outputs/rlbench_repro_launcher}"
 MODEL_FOLDER="${MODEL_FOLDER:-$REPO_ROOT/data/bridgevla_ckpt/bridgevla/rlbench}"
 EVAL_DATAFOLDER="${EVAL_DATAFOLDER:-$REPO_ROOT/data/RLBench_EVAL_DATA}"
+EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-$REPO_ROOT/outputs}"
 RESULT_LOG_DIR="${RESULT_LOG_DIR:-rlbench_repro}"
 GPU_IDS="${GPU_IDS:-0}"
 DISPLAY_IDS="${DISPLAY_IDS:-}"
 
-export EVAL_DATAFOLDER MODEL_FOLDER RESULT_LOG_DIR GPU_IDS DISPLAY_IDS
+export EVAL_DATAFOLDER MODEL_FOLDER EVAL_OUTPUT_ROOT RESULT_LOG_DIR GPU_IDS DISPLAY_IDS
 : "${BRIDGEVLA_START_XVFB:=1}"
 export BRIDGEVLA_START_XVFB
 
@@ -116,6 +117,7 @@ fi
 
 "$PYTHON" "$SCRIPT_DIR/aggregate_runs.py" \
   --model-folder "$MODEL_FOLDER" \
+  --eval-output-root "$EVAL_OUTPUT_ROOT" \
   --log-dir "$RESULT_LOG_DIR" \
   --runs 1,2,3,4,5 > "$LOG_DIR/aggregate.txt" 2>&1
 cat "$LOG_DIR/aggregate.txt" >> "$LOG_DIR/status.txt"

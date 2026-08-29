@@ -151,6 +151,12 @@ def get_eval_parser():
     parser.add_argument("--mvt_cfg_path", type=str, default=None)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--log-name", type=str, default="test/1")
+    parser.add_argument(
+        "--eval-output-root",
+        type=str,
+        default=None,
+        help="Root directory for evaluation artifacts; defaults to <repo>/outputs.",
+    )
     parser.add_argument("--model-name", type=str, default="model_80.pth")
     parser.add_argument("--use-input-place-with-mean", action="store_true")
     parser.add_argument("--save-video", action="store_true")

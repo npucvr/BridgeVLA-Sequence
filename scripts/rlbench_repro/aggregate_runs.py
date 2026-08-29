@@ -2,8 +2,9 @@
 """Aggregate repeated RLBench eval runs into paper-style mean +- std.
 
 Reads eval_results.csv files produced by eval.py under
-<model_folder>/eval/rlbench_repro/run_<id>/model_80/eval_results.csv
-and prints per-task mean/std plus the 18-task average.
+<eval_output_root>/<log_dir>/run_<id>/model_80/eval_results.csv
+and prints per-task mean/std plus the 18-task average.  If no output root is
+provided, the legacy <model_folder>/eval location is used.
 """
 import argparse
 import csv
@@ -50,15 +51,25 @@ def load_run(csv_path: Path) -> dict[str, float]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-folder", required=True)
+    ap.add_argument(
+        "--eval-output-root",
+        default=None,
+        help="Root containing evaluation logs; defaults to <model-folder>/eval.",
+    )
     ap.add_argument("--runs", default="1,2,3,4,5", help="comma-separated run ids")
     ap.add_argument("--log-dir", default="rlbench_repro")
     args = ap.parse_args()
 
     model_folder = Path(args.model_folder).expanduser().resolve()
+    eval_output_root = (
+        Path(args.eval_output_root).expanduser().resolve()
+        if args.eval_output_root is not None
+        else model_folder / "eval"
+    )
     run_ids = [x.strip() for x in args.runs.split(",") if x.strip()]
     all_runs = []
     for run_id in run_ids:
-        csv_path = model_folder / "eval" / args.log_dir / f"run_{run_id}" / "model_80" / "eval_results.csv"
+        csv_path = eval_output_root / args.log_dir / f"run_{run_id}" / "model_80" / "eval_results.csv"
         if not csv_path.exists():
             print(f"[missing] {csv_path}")
             continue

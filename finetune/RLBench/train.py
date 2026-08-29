@@ -519,7 +519,12 @@ if __name__ == "__main__":
     parser.add_argument("--mvt_cfg_opts", type=str, default="")
     parser.add_argument("--exp_cfg_opts", type=str, default="")
     parser.add_argument("--exp_note", type=str, default="")
-    parser.add_argument("--log_dir", type=str, default="")
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default=os.path.abspath(os.path.join(os.path.dirname(__file__), "../..", "outputs")),
+        help="Root directory for training artifacts; defaults to <repo>/outputs.",
+    )
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--num_train", type=int, default=100)

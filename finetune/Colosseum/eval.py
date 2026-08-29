@@ -465,7 +465,13 @@ if __name__ == "__main__":
     if args.log_name is None:
         args.log_name = "none"
 
-    args.eval_log_dir = os.path.join(args.model_folder, args.log_name)
+    if args.eval_output_root is None:
+        args.eval_output_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../..", "outputs")
+        )
+    else:
+        args.eval_output_root = os.path.abspath(os.path.expanduser(args.eval_output_root))
+    args.eval_log_dir = os.path.join(args.eval_output_root, args.log_name)
 
     os.makedirs(args.eval_log_dir, exist_ok=True)
 
