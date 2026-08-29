@@ -50,7 +50,14 @@ from utils.peract_utils_colosseum import (
 )
 
 # new train takes the dataset as input
-def train(agent, dataset, training_iterations,epoch,rank=0):
+def train(
+    agent,
+    dataset,
+    training_iterations,
+    epoch,
+    rank=0,
+    sequence_training=False,
+):
     agent.train()
     log = defaultdict(list)
 
@@ -70,12 +77,21 @@ def train(agent, dataset, training_iterations,epoch,rank=0):
         }
         batch["tasks"] = raw_batch["tasks"]
         batch["lang_goal"] = raw_batch["lang_goal"]
-        update_args={
-                "replay_sample": batch,
-                "backprop": True,
-                "reset_log": (iteration == 0),
-            }
-        out=agent.update(**update_args)
+        update_args = {
+            "replay_sample": batch,
+            "backprop": True,
+            "reset_log": (iteration == 0),
+        }
+        has_sequence_batch = "valid_mask" in batch
+        if has_sequence_batch != sequence_training:
+            raise RuntimeError(
+                "dataset/trainer sequence mode mismatch: "
+                f"configured={sequence_training}, batch_has_valid_mask={has_sequence_batch}"
+            )
+        if sequence_training:
+            out = agent.update_sequence(**update_args)
+        else:
+            out = agent.update(**update_args)
         dist.barrier()
         if rank == 0:
             step=epoch*training_iterations+iteration
@@ -232,6 +248,20 @@ def experiment(cmd_args):
         print(f"BATCH_SIZE_TRAIN={BATCH_SIZE_TRAIN}")
 
     NUM_TRAIN = 100
+    sequence_training = bool(
+        exp_cfg.hidden_state_sequence_training
+        or cmd_args.hidden_state_sequence_training
+    )
+    sequence_length = int(
+        cmd_args.hidden_state_sequence_length
+        if cmd_args.hidden_state_sequence_length is not None
+        else exp_cfg.hidden_state_sequence_length
+    )
+    if sequence_training and sequence_length < 2:
+        raise ValueError(
+            "hidden_state_sequence_length must be at least 2 when "
+            "sequence training is enabled"
+        )
     # to match peract, iterations per epoch
     TRAINING_ITERATIONS = int(exp_cfg.train_iter // (exp_cfg.bs * dist.get_world_size()))
 
@@ -260,6 +290,8 @@ def experiment(cmd_args):
         num_workers=exp_cfg.num_workers,
         only_train=True,
         sample_distribution_mode=exp_cfg.sample_distribution_mode,
+        sequence_training=sequence_training,
+        sequence_length=sequence_length,
     )
     train_dataset, _ = get_dataset_func()
     t_end = time.time()
@@ -273,6 +305,10 @@ def experiment(cmd_args):
         mvt_cfg.merge_from_list(cmd_args.mvt_cfg_opts.split(" "))
 
     mvt_cfg.feat_dim = get_num_feat(exp_cfg.peract)
+    if sequence_training and not mvt_cfg.hidden_state_enabled:
+        raise ValueError(
+            "hidden-state sequence training requires hidden_state_enabled=True"
+        )
     mvt_cfg.freeze()
 
     # for maintaining backward compatibility
@@ -287,8 +323,13 @@ def experiment(cmd_args):
         **mvt_cfg,
     )
     backbone=backbone.to(local_rank)
-    # if ddp:
-    backbone = DDP(backbone, device_ids=[local_rank],find_unused_parameters=True)
+    # Do not rebroadcast frozen BatchNorm buffers between sequence steps.
+    backbone = DDP(
+        backbone,
+        device_ids=[local_rank],
+        find_unused_parameters=True,
+        broadcast_buffers=not sequence_training,
+    )
 
     agent = bridgevla_agent.RVTAgent(
         network=backbone,
@@ -349,7 +390,14 @@ def experiment(cmd_args):
 
         print(f"Rank [{dist.get_rank()}], Epoch [{i}]: Training on train dataset")
 
-        out = train(agent, train_dataset, TRAINING_ITERATIONS,epoch=i,rank=dist.get_rank())
+        out = train(
+            agent,
+            train_dataset,
+            TRAINING_ITERATIONS,
+            epoch=i,
+            rank=dist.get_rank(),
+            sequence_training=sequence_training,
+        )
 
         if dist.get_rank()==0 and (i %10==0 or i == end_epoch-1):
             # TODO: add logic to only save some models
@@ -380,5 +428,16 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_vision_tower", action="store_true")
     parser.add_argument("--load_pretrain", action="store_true")
     parser.add_argument("--pretrain_path", type=str, default=None)
+    parser.add_argument(
+        "--hidden_state_sequence_training",
+        action="store_true",
+        help="Train the hidden-state route on forward replay sequences.",
+    )
+    parser.add_argument(
+        "--hidden_state_sequence_length",
+        type=int,
+        default=None,
+        help="Number of chronological transitions in each hidden-state window.",
+    )
     cmd_args = parser.parse_args()
     experiment(cmd_args)

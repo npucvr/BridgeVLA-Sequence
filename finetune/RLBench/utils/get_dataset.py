@@ -15,6 +15,7 @@ from peract_utils_rlbench import (
     ROTATION_RESOLUTION,
     VOXEL_SIZES,
 )
+from yarr.replay_buffer.sequence_replay_buffer import SequenceReplayBuffer
 from yarr.replay_buffer.wrappers.pytorch_replay_buffer import PyTorchReplayBuffer
 
 
@@ -47,7 +48,16 @@ def get_dataset(
     only_train,
     sample_distribution_mode="transition_uniform",
     clip_cache_dir=None,
+    sequence_training=False,
+    sequence_length=1,
 ):
+
+    sequence_training = bool(sequence_training)
+    sequence_length = int(sequence_length)
+    if sequence_training and sequence_length < 2:
+        raise ValueError(
+            "sequence_length must be at least 2 when sequence_training is enabled"
+        )
 
     train_replay_buffer = create_replay(
         batch_size=BATCH_SIZE_TRAIN,
@@ -154,9 +164,19 @@ def get_dataset(
     with torch.cuda.device(device):
         torch.cuda.empty_cache()
 
-    # wrap buffer with PyTorch dataset and make iterator
+    # The legacy replay remains a one-step buffer.  Sequence training uses an
+    # opt-in forward sampler so existing replay files and the default random
+    # transition path remain unchanged.
+    if sequence_training:
+        train_replay_source = SequenceReplayBuffer(
+            train_replay_buffer,
+            sequence_length=sequence_length,
+        )
+    else:
+        train_replay_source = train_replay_buffer
+
     train_wrapped_replay = PyTorchReplayBuffer(
-        train_replay_buffer,
+        train_replay_source,
         sample_mode="random",
         num_workers=num_workers,
         sample_distribution_mode=sample_distribution_mode,

@@ -38,6 +38,8 @@ _C.hidden_state_enabled = False
 _C.hidden_state_dim = 128
 _C.hidden_state_action_dim = 8
 _C.hidden_state_token_bottleneck = 128
+_C.hidden_state_update_heads = 4
+_C.hidden_state_update_dropout = 0.0
 
 
 def get_cfg_defaults():

@@ -5,6 +5,9 @@ num_workers: 3
 epochs: 100
 train_iter: 160000
 sample_distribution_mode: task_uniform
+# Enable these for the chronological H-token hidden-state route.
+hidden_state_sequence_training: false
+hidden_state_sequence_length: 4
 peract:
   lr: 8e-5 # 
   transform_augmentation_xyz: [0.125, 0.125, 0.125]

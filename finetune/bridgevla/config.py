@@ -13,6 +13,10 @@ _C.epochs = 100
 _C.num_workers = 0
 # 'transition_uniform' or 'task_uniform'
 _C.sample_distribution_mode = 'transition_uniform'
+# Opt-in chronological training for the hidden-state route.  The legacy
+# transition sampler remains the default for checkpoint compatibility.
+_C.hidden_state_sequence_training = False
+_C.hidden_state_sequence_length = 4
 _C.train_iter = 16 * 10000
 _C.use_scheduler = True
 # arguments present in both peract and rvt

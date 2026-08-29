@@ -220,6 +220,70 @@ class UniformReplayBuffer(ReplayBuffer):
     def batch_size(self):
         return self._batch_size
 
+    # The sequence sampler uses this small, explicit adapter instead of
+    # duplicating the disk/RAM record layout in a wrapper.  The legacy replay
+    # sampling API remains unchanged.
+    def sequence_task_local_index(self, global_index):
+        """Return the task/local coordinates for a global replay index."""
+        global_index = int(global_index)
+        if global_index < 0 or global_index >= self._replay_capacity:
+            raise IndexError(f"global replay index out of range: {global_index}")
+        task_idx, local_idx = self._index_mapping[global_index]
+        task_idx, local_idx = int(task_idx), int(local_idx)
+        if task_idx < 0 or local_idx < 0:
+            raise RuntimeError(
+                f"Replay index {global_index} has no task/local mapping"
+            )
+        return task_idx, local_idx
+
+    def sequence_global_index(self, task_idx, local_idx):
+        """Return the global index for a task-local replay record."""
+        task_idx, local_idx = int(task_idx), int(local_idx)
+        matches = np.flatnonzero(
+            (self._index_mapping[:, 0] == task_idx)
+            & (self._index_mapping[:, 1] == local_idx)
+        )
+        if len(matches) == 0:
+            return None
+        return int(matches[-1])
+
+    def sequence_task_length(self, task_idx):
+        """Return the number of records currently stored for one task."""
+        count = self._task_add_count[int(task_idx)]
+        return int(count.value if hasattr(count, "value") else count)
+
+    def sequence_task_name(self, task_idx):
+        """Return the user-facing name for a task index."""
+        return self._task_names[int(task_idx)]
+
+    def sequence_transition_record(self, task_idx, local_idx):
+        """Read one raw transition for the forward sequence adapter."""
+        task_idx, local_idx = int(task_idx), int(local_idx)
+        if self._disk_saving:
+            path = os.path.join(
+                self._task_replay_storage_folders[task_idx],
+                f"{local_idx}.replay",
+            )
+            try:
+                with open(path, "rb") as handle:
+                    return pickle.load(handle)
+            except FileNotFoundError as error:
+                raise RuntimeError(
+                    "Sequence replay record is missing: "
+                    f"task={task_idx}, local_index={local_idx}, path={path}"
+                ) from error
+
+        global_index = self.sequence_global_index(task_idx, local_idx)
+        if global_index is None:
+            raise RuntimeError(
+                "Replay does not contain task/local mapping for "
+                f"({task_idx}, {local_idx})"
+            )
+        return {
+            element.name: np.array(self._store[element.name][global_index])
+            for element in self._storage_signature
+        }
+
     def _create_storage(self, store=None):
         """Creates the numpy arrays used to store transitions.
         """

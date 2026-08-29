@@ -48,7 +48,14 @@ from utils.peract_utils_rlbench import (
     TRAIN_REPLAY_STORAGE_DIR,
 )
 
-def train(agent, dataset, training_iterations,epoch,rank=0):
+def train(
+    agent,
+    dataset,
+    training_iterations,
+    epoch,
+    rank=0,
+    sequence_training=False,
+):
     agent.train()
     log = defaultdict(list)
 
@@ -68,12 +75,21 @@ def train(agent, dataset, training_iterations,epoch,rank=0):
         }
         batch["tasks"] = raw_batch["tasks"]
         batch["lang_goal"] = raw_batch["lang_goal"]
-        update_args={
-                "replay_sample": batch,
-                "backprop": True,
-                "reset_log": (iteration == 0),
-            }
-        out=agent.update(**update_args)
+        update_args = {
+            "replay_sample": batch,
+            "backprop": True,
+            "reset_log": (iteration == 0),
+        }
+        has_sequence_batch = "valid_mask" in batch
+        if has_sequence_batch != sequence_training:
+            raise RuntimeError(
+                "dataset/trainer sequence mode mismatch: "
+                f"configured={sequence_training}, batch_has_valid_mask={has_sequence_batch}"
+            )
+        if sequence_training:
+            out = agent.update_sequence(**update_args)
+        else:
+            out = agent.update(**update_args)
         dist.barrier()
         if rank == 0:
             step=epoch*training_iterations+iteration
@@ -157,10 +173,31 @@ def load_initial_checkpoint(backbone, checkpoint_path):
         checkpoint_path, map_location="cpu", weights_only=True
     )
     state = checkpoint.get("model_state", checkpoint)
+    hidden_route_prefixes = (
+        "mvt1.A_psi.",
+        "mvt1.F_phi.",
+        "mvt1.U_omega.",
+        "mvt1.hidden_state_to_feat.",
+        "mvt1.hidden_state_to_trans.",
+    )
+    if not backbone.mvt1.hidden_state_enabled:
+        # A route checkpoint can still initialize the released policy when the
+        # optional route is disabled; its extra keys are intentionally ignored.
+        state = {
+            key: value
+            for key, value in state.items()
+            if not key.startswith(hidden_route_prefixes)
+        }
     missing, unexpected = backbone.load_state_dict(state, strict=False)
     unexpected = list(unexpected)
     allowed_missing_prefixes = (
-        ("mvt1.A_psi.", "mvt1.F_phi.")
+        (
+            "mvt1.A_psi.",
+            "mvt1.F_phi.",
+            "mvt1.U_omega.",
+            "mvt1.hidden_state_to_feat.",
+            "mvt1.hidden_state_to_trans.",
+        )
         if backbone.mvt1.hidden_state_enabled
         else ()
     )
@@ -181,14 +218,20 @@ def load_initial_checkpoint(backbone, checkpoint_path):
 
 
 def freeze_for_hidden_state_route(backbone):
-    """Freeze BridgeVLA and train only ``A_psi`` and ``F_phi``."""
+    """Freeze BridgeVLA and train only the hidden-state route modules."""
     if not backbone.mvt1.hidden_state_enabled:
         raise ValueError(
             "hidden_state_route_only requires hidden_state_enabled=True"
         )
     for parameter in backbone.parameters():
         parameter.requires_grad = False
-    trainable_modules = [backbone.mvt1.A_psi, backbone.mvt1.F_phi]
+    trainable_modules = [
+        backbone.mvt1.A_psi,
+        backbone.mvt1.F_phi,
+        backbone.mvt1.U_omega,
+        backbone.mvt1.hidden_state_to_feat,
+        backbone.mvt1.hidden_state_to_trans,
+    ]
     for module in trainable_modules:
         for parameter in module.parameters():
             parameter.requires_grad = True
@@ -273,6 +316,20 @@ def experiment(cmd_args):
         print(f"BATCH_SIZE_TRAIN={BATCH_SIZE_TRAIN}")
 
     NUM_TRAIN = cmd_args.num_train
+    sequence_training = bool(
+        exp_cfg.hidden_state_sequence_training
+        or cmd_args.hidden_state_sequence_training
+    )
+    sequence_length = int(
+        cmd_args.hidden_state_sequence_length
+        if cmd_args.hidden_state_sequence_length is not None
+        else exp_cfg.hidden_state_sequence_length
+    )
+    if sequence_training and sequence_length < 2:
+        raise ValueError(
+            "hidden_state_sequence_length must be at least 2 when "
+            "sequence training is enabled"
+        )
     # to match peract, iterations per epoch
     TRAINING_ITERATIONS = int(exp_cfg.train_iter // (exp_cfg.bs * dist.get_world_size()))
 
@@ -300,6 +357,8 @@ def experiment(cmd_args):
         only_train=True,
         sample_distribution_mode=exp_cfg.sample_distribution_mode,
         clip_cache_dir=cmd_args.clip_cache_dir,
+        sequence_training=sequence_training,
+        sequence_length=sequence_length,
     )
     train_dataset, _ = get_dataset_func()
     t_end = time.time()
@@ -316,6 +375,10 @@ def experiment(cmd_args):
     if cmd_args.hidden_state_route_only and not mvt_cfg.hidden_state_enabled:
         raise ValueError(
             "--hidden_state_route_only requires hidden_state_enabled=True"
+        )
+    if sequence_training and not mvt_cfg.hidden_state_enabled:
+        raise ValueError(
+            "hidden-state sequence training requires hidden_state_enabled=True"
         )
     mvt_cfg.freeze()
 
@@ -346,7 +409,14 @@ def experiment(cmd_args):
         freeze_for_hidden_state_route(backbone)
 
     backbone = backbone.to(local_rank)
-    backbone = DDP(backbone, device_ids=[local_rank], find_unused_parameters=True)
+    # Chronological sequence updates accumulate several forward graphs. The
+    # frozen BatchNorm buffers must not be rebroadcast between those forwards.
+    backbone = DDP(
+        backbone,
+        device_ids=[local_rank],
+        find_unused_parameters=True,
+        broadcast_buffers=not sequence_training,
+    )
 
     agent = bridgevla_agent.RVTAgent(
         network=backbone,
@@ -417,7 +487,14 @@ def experiment(cmd_args):
 
         print(f"Rank [{dist.get_rank()}], Epoch [{i}]: Training on train dataset")
 
-        out = train(agent, train_dataset, TRAINING_ITERATIONS,epoch=i,rank=dist.get_rank())
+        out = train(
+            agent,
+            train_dataset,
+            TRAINING_ITERATIONS,
+            epoch=i,
+            rank=dist.get_rank(),
+            sequence_training=sequence_training,
+        )
 
         if dist.get_rank()==0 and (i %10==0 or i == end_epoch-1):
             # TODO: add logic to only save some models
@@ -456,5 +533,16 @@ if __name__ == "__main__":
     parser.add_argument("--pretrain_path", type=str, default=None)
     parser.add_argument("--init_checkpoint", type=str, default=None)
     parser.add_argument("--hidden_state_route_only", action="store_true")
+    parser.add_argument(
+        "--hidden_state_sequence_training",
+        action="store_true",
+        help="Train the hidden-state route on forward replay sequences.",
+    )
+    parser.add_argument(
+        "--hidden_state_sequence_length",
+        type=int,
+        default=None,
+        help="Number of chronological transitions in each hidden-state window.",
+    )
     cmd_args = parser.parse_args()
     experiment(cmd_args)

@@ -628,10 +628,39 @@ class RVTAgent:
         replay_sample: dict,
         backprop: bool = True,
         reset_log: bool = False,
+        _hidden_state_override=None,
+        _loss_weight=None,
+        _optimizer_step=True,
+        _return_internal=False,
+        _manage_log=True,
     ) -> dict:
+        # hidden state for the single-transition update
         assert replay_sample["rot_grip_action_indicies"].shape[1:] == (1, 4)
         assert replay_sample["ignore_collisions"].shape[1:] == (1, 1)
         assert replay_sample["gripper_pose"].shape[1:] == (1, 7)
+
+        if _loss_weight is not None:
+            _loss_weight = _loss_weight.to(device=self._device, dtype=torch.float32)
+            if _loss_weight.ndim != 1 or _loss_weight.shape[0] != replay_sample[
+                "gripper_pose"
+            ].shape[0]:
+                raise ValueError(
+                    "_loss_weight must have shape [B], got "
+                    f"{tuple(_loss_weight.shape)}"
+                )
+
+        def reduce_loss(per_sample_loss):
+            # CrossEntropyLoss(reduction='none') may retain spatial/class axes.
+            # First reduce those axes per batch element, then apply the optional
+            # sequence validity weights.
+            if per_sample_loss.ndim > 1:
+                per_sample_loss = per_sample_loss.reshape(
+                    per_sample_loss.shape[0], -1
+                ).mean(dim=1)
+            if _loss_weight is None:
+                return per_sample_loss.mean()
+            denominator = _loss_weight.sum().clamp_min(1.0)
+            return (per_sample_loss * _loss_weight).sum() / denominator
 
         # sample
         action_rot_grip = replay_sample["rot_grip_action_indicies"][
@@ -741,11 +770,21 @@ class RVTAgent:
         
         hidden_state_kwargs = {}
         if self._hidden_state_enabled:
-            hidden_state_kwargs["hidden_state_y"] = self._training_hidden_state(
-                replay_sample=replay_sample,
-                batch_size=bs,
-                device=pc[0].device,
-            )
+            if _hidden_state_override is None:
+                hidden_state = self._training_hidden_state(
+                    replay_sample=replay_sample,
+                    batch_size=bs,
+                    device=pc[0].device,
+                )
+            else:
+                hidden_state = _hidden_state_override
+                if hidden_state.ndim != 2 or hidden_state.shape[0] != bs:
+                    raise ValueError(
+                        "_hidden_state_override must have shape [B, D], got "
+                        f"{tuple(hidden_state.shape)}"
+                    )
+                hidden_state = hidden_state.to(device=pc[0].device)
+            hidden_state_kwargs["hidden_state_y"] = hidden_state
 
         out = self._network(
             pc=pc,
@@ -770,44 +809,58 @@ class RVTAgent:
         loss_log = {}
         if backprop:
             # cross-entropy loss
-            trans_loss = self._cross_entropy_loss(q_trans, action_trans).mean()    # Soft-label cross-entropy loss. The target has the same shape as the input and is no longer one-hot encoded, but represented by class probabilities.
-            rot_loss_x = rot_loss_y = rot_loss_z = 0.0
-            grip_loss = 0.0
-            collision_loss = 0.0
+            trans_loss = reduce_loss(
+                self._cross_entropy_loss(q_trans, action_trans)
+            )  # Soft-label cross-entropy loss.
+            # Reduce each component per batch item so sequence masks can be
+            # applied without changing the legacy single-step objective.
+            zero_loss = trans_loss.new_zeros(())
+            rot_loss_x = rot_loss_y = rot_loss_z = zero_loss
+            grip_loss = zero_loss
+            collision_loss = zero_loss
             if self.add_rgc_loss:
-                
-                rot_loss_x = self._cross_entropy_loss(
-                    rot_q[
-                        :,
-                        0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
-                    ],
-                    action_rot_x_one_hot.argmax(-1),
-                ).mean()
+                rot_loss_x = reduce_loss(
+                    self._cross_entropy_loss(
+                        rot_q[
+                            :,
+                            0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
+                        ],
+                        action_rot_x_one_hot.argmax(-1),
+                    )
+                )
 
-                rot_loss_y = self._cross_entropy_loss(
-                    rot_q[
-                        :,
-                        1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
-                    ],
-                    action_rot_y_one_hot.argmax(-1),
-                ).mean()
+                rot_loss_y = reduce_loss(
+                    self._cross_entropy_loss(
+                        rot_q[
+                            :,
+                            1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
+                        ],
+                        action_rot_y_one_hot.argmax(-1),
+                    )
+                )
 
-                rot_loss_z = self._cross_entropy_loss(
-                    rot_q[
-                        :,
-                        2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
-                    ],
-                    action_rot_z_one_hot.argmax(-1),
-                ).mean()
-                
-                grip_loss = self._cross_entropy_loss(
-                    grip_q,
-                    action_grip_one_hot.argmax(-1),
-                ).mean()
-                
-                collision_loss = self._cross_entropy_loss(
-                    collision_q, action_collision_one_hot.argmax(-1)
-                ).mean()
+                rot_loss_z = reduce_loss(
+                    self._cross_entropy_loss(
+                        rot_q[
+                            :,
+                            2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
+                        ],
+                        action_rot_z_one_hot.argmax(-1),
+                    )
+                )
+
+                grip_loss = reduce_loss(
+                    self._cross_entropy_loss(
+                        grip_q,
+                        action_grip_one_hot.argmax(-1),
+                    )
+                )
+
+                collision_loss = reduce_loss(
+                    self._cross_entropy_loss(
+                        collision_q, action_collision_one_hot.argmax(-1)
+                    )
+                )
 
             total_loss = (
                 trans_loss
@@ -819,11 +872,10 @@ class RVTAgent:
             )
 
 
-            self._optimizer.zero_grad(set_to_none=True)
-            
-            total_loss.backward() 
-            self._optimizer.step()
-
+            if _optimizer_step:
+                self._optimizer.zero_grad(set_to_none=True)
+                total_loss.backward()
+                self._optimizer.step()
 
             loss_log = {
                 "total_loss": total_loss.item(),
@@ -835,12 +887,211 @@ class RVTAgent:
                 "collision_loss": collision_loss.item(),
                 "lr": self._optimizer.param_groups[0]["lr"],
             }
-            manage_loss_log(self, loss_log, reset_log=reset_log)
+            if _manage_log:
+                manage_loss_log(self, loss_log, reset_log=reset_log)
             return_out.update(loss_log)
+            if _return_internal:
+                return_out["_loss_tensor"] = total_loss
+                return_out["_hidden_state_y"] = out.get("hidden_state_y")
 
 
         return return_out
 
+
+    @staticmethod
+    def _slice_sequence_sample(replay_sample, timestep, sequence_length):
+        """Extract one ``[B, 1, ...]`` transition from a sequence batch."""
+        step_sample = {}
+        sequence_metadata = {"valid_mask", "indices", "terminal", "timeout", "reward"}
+        for key, value in replay_sample.items():
+            if key in sequence_metadata:
+                continue
+            if key == "tasks":
+                step_sample[key] = value
+                continue
+            if isinstance(value, torch.Tensor):
+                if key == "action" and value.ndim >= 2 and value.shape[1] == sequence_length:
+                    step_sample[key] = value[:, timestep]
+                elif value.ndim >= 2 and value.shape[1] == sequence_length:
+                    step_sample[key] = value[:, timestep : timestep + 1]
+                else:
+                    step_sample[key] = value
+            elif isinstance(value, np.ndarray):
+                if key == "action" and value.ndim >= 2 and value.shape[1] == sequence_length:
+                    step_sample[key] = value[:, timestep]
+                elif value.ndim >= 2 and value.shape[1] == sequence_length:
+                    step_sample[key] = value[:, timestep : timestep + 1]
+                else:
+                    step_sample[key] = value
+            else:
+                step_sample[key] = value
+        return step_sample
+
+    @staticmethod
+    def _select_sequence_rows(step_sample, row_mask):
+        """Remove terminal-padding rows before running the vision network."""
+        selected = {}
+        row_mask_cpu = row_mask.detach().cpu().numpy()
+        for key, value in step_sample.items():
+            if key == "tasks":
+                selected[key] = [
+                    task for task, keep in zip(value, row_mask_cpu) if keep
+                ]
+            elif isinstance(value, torch.Tensor):
+                if value.ndim > 0 and value.shape[0] == row_mask.shape[0]:
+                    selected[key] = value[row_mask]
+                else:
+                    selected[key] = value
+            elif isinstance(value, np.ndarray):
+                if value.ndim > 0 and value.shape[0] == row_mask.shape[0]:
+                    selected[key] = value[row_mask_cpu]
+                else:
+                    selected[key] = value
+            else:
+                selected[key] = value
+        return selected
+
+    def update_sequence(
+        self,
+        replay_sample: dict,
+        backprop: bool = True,
+        reset_log: bool = False,
+    ) -> dict:
+        """Train the H-token route on chronological replay sequences.
+
+        Each valid step runs the ordinary BridgeVLA action objective.  The
+        posterior returned by ``U_omega`` is then passed, without detaching, to
+        ``F_phi`` together with the demonstrated action before the next step.
+        This is the differentiable recurrence that the independent transition
+        trainer cannot provide.
+        """
+        if not self._hidden_state_enabled:
+            raise ValueError("update_sequence requires hidden_state_enabled=True")
+        if not backprop:
+            raise ValueError("update_sequence requires backprop=True")
+        if "valid_mask" not in replay_sample or "action" not in replay_sample:
+            raise ValueError(
+                "sequence batches must contain valid_mask and action fields"
+            )
+
+        valid_mask = replay_sample["valid_mask"]
+        action_sequence = replay_sample["action"]
+        if not isinstance(valid_mask, torch.Tensor):
+            valid_mask = torch.as_tensor(valid_mask, device=self._device)
+        else:
+            valid_mask = valid_mask.to(self._device)
+        if not isinstance(action_sequence, torch.Tensor):
+            action_sequence = torch.as_tensor(action_sequence, device=self._device)
+        else:
+            action_sequence = action_sequence.to(self._device)
+
+        if valid_mask.ndim != 2:
+            raise ValueError(
+                "valid_mask must have shape [B, L], got "
+                f"{tuple(valid_mask.shape)}"
+            )
+        if action_sequence.ndim != 3:
+            raise ValueError(
+                "sequence action must have shape [B, L, A], got "
+                f"{tuple(action_sequence.shape)}"
+            )
+        batch_size, sequence_length = valid_mask.shape
+        if action_sequence.shape[:2] != (batch_size, sequence_length):
+            raise ValueError(
+                "valid_mask and action sequence lengths disagree: "
+                f"mask={tuple(valid_mask.shape)}, action={tuple(action_sequence.shape)}"
+            )
+
+        self._optimizer.zero_grad(set_to_none=True)
+        # A sequence accumulates several forward graphs before backward. Batch
+        #Norm running-stat buffers are otherwise mutated by the next timestep,
+        # invalidating the statistics saved by NativeBatchNormBackward. Freeze
+        # those buffers for chronological updates; route modules use LayerNorm.
+        for module in self._net_mod.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.eval()
+        # DDP normally broadcasts buffers before every forward. That would
+        # still mutate frozen BatchNorm running statistics between timesteps,
+        # even though their modules are in eval mode.
+        if isinstance(self._network, DistributedDataParallel):
+            self._network.broadcast_buffers = False
+        hidden_state = self._initial_hidden_state(batch_size, self._device)
+        accumulated_loss = None
+        accumulated_weight = valid_mask.new_zeros(())
+        weighted_log = {}
+
+        for timestep in range(sequence_length):
+            timestep_mask = valid_mask[:, timestep].float()
+            active_rows = timestep_mask.bool()
+            if active_rows.sum().item() == 0:
+                break
+            step_sample = self._slice_sequence_sample(
+                replay_sample, timestep, sequence_length
+            )
+            step_sample = self._select_sequence_rows(step_sample, active_rows)
+            active_indices = active_rows.nonzero(as_tuple=False).squeeze(-1)
+            step_output = self.update(
+                replay_sample=step_sample,
+                backprop=True,
+                reset_log=reset_log and timestep == 0,
+                _hidden_state_override=hidden_state[active_rows],
+                _loss_weight=None,
+                _optimizer_step=False,
+                _return_internal=True,
+                _manage_log=False,
+            )
+            step_loss = step_output.get("_loss_tensor")
+            posterior = step_output.get("_hidden_state_y")
+            if step_loss is None or posterior is None:
+                raise RuntimeError(
+                    "hidden-state sequence update did not return U_omega posterior"
+                )
+
+            weight = timestep_mask.sum()
+            weighted_step_loss = step_loss * weight
+            accumulated_loss = (
+                weighted_step_loss
+                if accumulated_loss is None
+                else accumulated_loss + weighted_step_loss
+            )
+            accumulated_weight = accumulated_weight + weight
+            for key, value in step_output.items():
+                if key.endswith("_loss"):
+                    weighted_log[key] = weighted_log.get(key, 0.0) + value * weight.item()
+            if timestep + 1 < sequence_length:
+                next_hidden_state = self._net_mod.update_hidden_state(
+                    posterior,
+                    action_sequence[active_rows, timestep],
+                )
+                # Scatter the active rows back into the full batch without an
+                # in-place write, preserving the graph through F_phi.
+                candidate_hidden_state = hidden_state.index_copy(
+                    0,
+                    active_indices,
+                    next_hidden_state,
+                )
+                next_valid = valid_mask[:, timestep + 1].bool().unsqueeze(-1)
+                hidden_state = torch.where(
+                    next_valid,
+                    candidate_hidden_state,
+                    hidden_state,
+                )
+
+        if accumulated_loss is None or accumulated_weight.item() <= 0:
+            raise RuntimeError("sequence batch contains no valid transitions")
+        total_loss = accumulated_loss / accumulated_weight.clamp_min(1.0)
+        total_loss.backward()
+        self._optimizer.step()
+
+        result = {
+            "total_loss": total_loss.item(),
+            "sequence_valid_steps": accumulated_weight.item(),
+            "lr": self._optimizer.param_groups[0]["lr"],
+        }
+        for key, value in weighted_log.items():
+            result[key] = value / accumulated_weight.item()
+        manage_loss_log(self, result, reset_log=reset_log)
+        return result
 
 
     def update_gembench(
@@ -849,6 +1100,7 @@ class RVTAgent:
         backprop: bool = True,
         reset_log: bool = False,
         cameras=["front", "left_shoulder", "right_shoulder", "wrist"],
+        _hidden_state_override=None,
     ) -> dict:
         action_ignore_collisions = replay_sample["ignore_collisions"].unsqueeze(1).int()  # (b, 1) of int
         action_gripper_pose = replay_sample["gripper_pose"]  # (b, 8)  
@@ -961,11 +1213,21 @@ class RVTAgent:
         
         hidden_state_kwargs = {}
         if self._hidden_state_enabled:
-            hidden_state_kwargs["hidden_state_y"] = self._training_hidden_state(
-                replay_sample=replay_sample,
-                batch_size=bs,
-                device=pc[0].device,
-            )
+            if _hidden_state_override is None:
+                hidden_state = self._training_hidden_state(
+                    replay_sample=replay_sample,
+                    batch_size=bs,
+                    device=pc[0].device,
+                )
+            else:
+                hidden_state = _hidden_state_override
+                if hidden_state.ndim != 2 or hidden_state.shape[0] != bs:
+                    raise ValueError(
+                        "_hidden_state_override must have shape [B, D], got "
+                        f"{tuple(hidden_state.shape)}"
+                    )
+                hidden_state = hidden_state.to(device=pc[0].device)
+            hidden_state_kwargs["hidden_state_y"] = hidden_state
 
         out = self._network(
             pc=pc,
@@ -989,9 +1251,10 @@ class RVTAgent:
         loss_log = {}
         if backprop:
             trans_loss = self._cross_entropy_loss(q_trans, action_trans).mean()  
-            rot_loss_x = rot_loss_y = rot_loss_z = 0.0
-            grip_loss = 0.0
-            collision_loss = 0.0
+            zero_loss = trans_loss.new_zeros(())
+            rot_loss_x = rot_loss_y = rot_loss_z = zero_loss
+            grip_loss = zero_loss
+            collision_loss = zero_loss
             if self.add_rgc_loss:
                 
                 rot_loss_x = self._cross_entropy_loss(
@@ -1121,6 +1384,13 @@ class RVTAgent:
             language_goal=language_goal,
             **hidden_state_kwargs,
         )
+        if self._hidden_state_enabled:
+            posterior_hidden_state = out.get("hidden_state_y")
+            if posterior_hidden_state is None:
+                raise RuntimeError(
+                    "hidden-state network did not return the U_omega posterior"
+                )
+            self._hidden_state_y = posterior_hidden_state.detach()
         if visualize:
             q_trans, rot_q, grip_q, collision_q, y_q, _ = self.get_q(
                 out, dims=(bs, nc, h, w), only_pred=True, get_q_trans=True
@@ -1305,9 +1575,18 @@ class RVTAgent:
     def train(self):
         self._network.train()
         if self._hidden_state_route_only:
-            trainable_hidden_modules = {"A_psi", "F_phi"}
+            trainable_hidden_modules = {
+                "A_psi",
+                "F_phi",
+                "U_omega",
+                "hidden_state_to_feat",
+                "hidden_state_to_trans",
+            }
             for name, module in self._net_mod.mvt1.named_children():
                 if name not in trainable_hidden_modules:
                     module.eval()
             self._net_mod.mvt1.A_psi.train()
             self._net_mod.mvt1.F_phi.train()
+            self._net_mod.mvt1.U_omega.train()
+            self._net_mod.mvt1.hidden_state_to_feat.train()
+            self._net_mod.mvt1.hidden_state_to_trans.train()

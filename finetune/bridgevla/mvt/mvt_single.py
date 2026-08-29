@@ -26,7 +26,7 @@ from bridgevla.mvt.attn import (
     FixedPositionalEncoding,
 )
 from bridgevla.mvt.raft_utils import ConvexUpSample
-from bridgevla.hidden_state import A_psi, F_phi
+from bridgevla.hidden_state import A_psi, F_phi, U_omega
 from PIL import Image
 
 
@@ -69,6 +69,8 @@ class MVT(nn.Module):
         hidden_state_dim=128,
         hidden_state_action_dim=8,
         hidden_state_token_bottleneck=128,
+        hidden_state_update_heads=4,
+        hidden_state_update_dropout=0.0,
     ):
         super().__init__()
         self.depth = depth
@@ -136,6 +138,8 @@ class MVT(nn.Module):
         self.hidden_state_dim = int(hidden_state_dim)
         self.hidden_state_action_dim = int(hidden_state_action_dim)
         self.hidden_state_token_bottleneck = int(hidden_state_token_bottleneck)
+        self.hidden_state_update_heads = int(hidden_state_update_heads)
+        self.hidden_state_update_dropout = float(hidden_state_update_dropout)
         if self.hidden_state_dim < 1:
             raise ValueError("hidden_state_dim must be >= 1")
         if self.hidden_state_action_dim < 1:
@@ -147,6 +151,12 @@ class MVT(nn.Module):
         # the original BridgeVLA checkpoint keys and default forward path
         # unchanged.
         if self.hidden_state_enabled:
+            self.U_omega = U_omega(
+                token_dim=self.vlm_dim,
+                hidden_state_dim=self.hidden_state_dim,
+                num_heads=self.hidden_state_update_heads,
+                dropout=self.hidden_state_update_dropout,
+            )
             self.A_psi = A_psi(
                 token_dim=self.vlm_dim,
                 token_bottleneck_dim=self.hidden_state_token_bottleneck,
@@ -156,6 +166,22 @@ class MVT(nn.Module):
                 hidden_dim=self.hidden_state_dim,
                 action_dim=self.hidden_state_action_dim,
             )
+            # pi_theta is conditioned on y_t as well as the corrected visual
+            # tokens.  This residual is deliberately small at initialization,
+            # so enabling the route starts close to the released policy while
+            # still giving U_omega/F_phi a direct action-loss gradient.
+            self.hidden_state_to_feat = nn.Linear(
+                self.hidden_state_dim,
+                int(feat_dim),
+            )
+            nn.init.normal_(self.hidden_state_to_feat.weight, std=1e-3)
+            nn.init.zeros_(self.hidden_state_to_feat.bias)
+            self.hidden_state_to_trans = nn.Linear(
+                self.hidden_state_dim,
+                self.num_img,
+            )
+            nn.init.normal_(self.hidden_state_to_trans.weight, std=1e-3)
+            nn.init.zeros_(self.hidden_state_to_trans.bias)
 
         self.up0 = ConvexUpSample(
             in_dim=self.vlm_dim,
@@ -324,13 +350,16 @@ class MVT(nn.Module):
         language_goal=None,
         forward_no_feat=False,
         hidden_state_y=None,
+        hidden_state_update=True,
         **kwargs,
     ):
         """
         :param img: tensor of shape (bs, num_img, img_feat_dim, h, w)
         :param img_aug: (float) magnitude of augmentation in rgb image
         :param rot_x_y: (bs, 2)
-        :param hidden_state_y: current episode hidden state, when enabled
+        :param hidden_state_y: action-predicted prior or posterior state.
+        :param hidden_state_update: whether to apply U_omega to current tokens;
+            stage-two reuses the posterior from the first pass.
         """
 
         bs, num_img, img_feat_dim, h, w = img.shape
@@ -388,9 +417,23 @@ class MVT(nn.Module):
         current_tokens = torch.stack(current_tokens)
 
         if self.hidden_state_enabled:
+            # ``hidden_state_y`` is the action-predicted prior y_t^-.
+            # U_omega consumes the current PaliGemma visual tokens H_t and
+            # produces the posterior y_t used by the token correction route.
+            if hidden_state_update:
+                updated_hidden_state = self.U_omega(
+                    hidden_state_y,
+                    current_tokens,
+                )
+            else:
+                if hidden_state_y is None:
+                    raise ValueError(
+                        "hidden_state_y is required when hidden_state_update=False"
+                    )
+                updated_hidden_state = hidden_state_y
             image_tokens = self.A_psi(
                 current_tokens,
-                hidden_state_y=hidden_state_y,
+                hidden_state_y=updated_hidden_state,
             )
         else:
             # Keep the original BridgeVLA path byte-for-byte in spirit: no
@@ -413,6 +456,11 @@ class MVT(nn.Module):
         
         trans = self.up0(x)
         trans = trans.view(bs, self.num_img, h, w)
+        if self.hidden_state_enabled:
+            hidden_trans = self.hidden_state_to_trans(updated_hidden_state)
+            trans = trans + hidden_trans.to(dtype=trans.dtype).view(
+                bs, self.num_img, 1, 1
+            )
 
 
         if not forward_no_feat:
@@ -460,7 +508,6 @@ class MVT(nn.Module):
 
                 # batch normalized features for rotation
                 feat_rot = self.feat_fc_init_bn(feat)
-                # feat_rot = self.feat_fc_init_bn(feat)
                 feat_x = self.feat_fc_x(feat_rot)
 
                 if self.training:
@@ -490,7 +537,31 @@ class MVT(nn.Module):
         else:
             out = {}
 
+        if self.hidden_state_enabled and not forward_no_feat:
+            hidden_feat = self.hidden_state_to_feat(updated_hidden_state)
+            if self.rot_ver == 0:
+                out["feat"] = out["feat"] + hidden_feat.to(
+                    dtype=out["feat"].dtype
+                )
+            elif self.rot_ver == 1:
+                offset = 0
+                for key in ("feat_ex_rot", "feat_x", "feat_y", "feat_z"):
+                    width = out[key].shape[-1]
+                    out[key] = out[key] + hidden_feat[
+                        :, offset : offset + width
+                    ].to(dtype=out[key].dtype)
+                    offset += width
+                if offset != hidden_feat.shape[-1]:
+                    raise RuntimeError(
+                        "hidden-state feature projection does not match MVT "
+                        f"outputs: consumed {offset}, projected {hidden_feat.shape[-1]}"
+                    )
+
         out.update({"trans": trans})
+        if self.hidden_state_enabled:
+            # Expose the posterior so the caller can carry it to the next
+            # observation without recomputing PaliGemma tokens.
+            out["hidden_state_y"] = updated_hidden_state
         return out
 
 

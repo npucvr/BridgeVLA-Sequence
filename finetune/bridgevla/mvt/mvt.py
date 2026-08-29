@@ -67,6 +67,8 @@ class MVT(nn.Module):
         hidden_state_dim=128,
         hidden_state_action_dim=8,
         hidden_state_token_bottleneck=128,
+        hidden_state_update_heads=4,
+        hidden_state_update_dropout=0.0,
     ):
         super().__init__()
 
@@ -319,6 +321,7 @@ class MVT(nn.Module):
         rot_x_y=None,
         language_goal=None,
         hidden_state_y=None,
+        hidden_state_update=True,
         **kwargs,
     ):
         """
@@ -332,7 +335,9 @@ class MVT(nn.Module):
             (bs, 3)
         :param rot_x_y: (bs, 2) rotation in x and y direction
         :param language_goal: str (bs,)language instruction
-        :param hidden_state_y: current episode hidden state, when enabled
+        :param hidden_state_y: action-predicted prior state, when enabled
+        :param hidden_state_update: apply U_omega on the first pass; stage-two
+            reuses that pass's posterior.
         """
         self.verify_inp(
             pc=pc,
@@ -362,10 +367,12 @@ class MVT(nn.Module):
         else:
             wpt_local_stage_one = wpt_local
 
-        # The hidden state belongs only to the first MVT pass. Stage-two uses
-        # the original BridgeVLA call path and receives no hidden state.
+        # U_omega is applied on the first pass.  Stage-two reuses that
+        # posterior while refining the same observation in a second view-space
+        # pass, so one environment step still performs one observation update.
         mvt1_kwargs = dict(kwargs)
         mvt1_kwargs["hidden_state_y"] = hidden_state_y
+        mvt1_kwargs["hidden_state_update"] = hidden_state_update
         mvt2_kwargs = dict(kwargs)
         out = self.mvt1(
             img=img,
@@ -458,6 +465,12 @@ class MVT(nn.Module):
                     dyn_cam_info=None,
                 )
         
+            if self.mvt1.hidden_state_enabled:
+                # The second MVT pass is a view-space refinement of the same
+                # observation.  Apply U_omega only once per environment step;
+                # reuse the posterior from the first pass here.
+                mvt2_kwargs["hidden_state_y"] = out["hidden_state_y"]
+                mvt2_kwargs["hidden_state_update"] = False
             out_mvt2 = self.mvt1(
                 img=img,
                 wpt_local=wpt_local2,
