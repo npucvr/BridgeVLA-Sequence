@@ -62,11 +62,11 @@ H-token checkpoint 的第 1 次运行复用此前已经完成的完整评测，�
 
 | Optimizer updates | `train_iter` | Checkpoint |
 |---:|---:|---|
-| 100 | 400 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%20400%20num_workers%201_hidden_state_enabled%20True/sequence_full_100/debug/08_28_18_10/model_last.pth) |
-| 250 | 1000 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%201000%20num_workers%201_hidden_state_enabled%20True/sequence_full_250/debug/08_28_18_10/model_last.pth) |
-| 500 | 2000 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%202000%20num_workers%201_hidden_state_enabled%20True/sequence_full_500/debug/08_28_18_10/model_last.pth) |
-| 1000 | 4000 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%204000%20num_workers%201_hidden_state_enabled%20True/sequence_full_1000/debug/08_28_18_10/model_last.pth) |
-| 2000 | 8000 | [`model_last.pth`](../data/hidden_state_sequence_full_v2/train/debug_train_iter%208000%20num_workers%201_hidden_state_enabled%20True/sequence_full_2000/debug/08_28_18_36/model_last.pth) |
+| 100 | 400 | [`model_last.pth`](../outputs/hidden_state_sequence_full_v2/train/debug_train_iter%20400%20num_workers%201_hidden_state_enabled%20True/sequence_full_100/debug/08_28_18_10/model_last.pth) |
+| 250 | 1000 | [`model_last.pth`](../outputs/hidden_state_sequence_full_v2/train/debug_train_iter%201000%20num_workers%201_hidden_state_enabled%20True/sequence_full_250/debug/08_28_18_10/model_last.pth) |
+| 500 | 2000 | [`model_last.pth`](../outputs/hidden_state_sequence_full_v2/train/debug_train_iter%202000%20num_workers%201_hidden_state_enabled%20True/sequence_full_500/debug/08_28_18_10/model_last.pth) |
+| 1000 | 4000 | [`model_last.pth`](../outputs/hidden_state_sequence_full_v2/train/debug_train_iter%204000%20num_workers%201_hidden_state_enabled%20True/sequence_full_1000/debug/08_28_18_10/model_last.pth) |
+| 2000 | 8000 | [`model_last.pth`](../outputs/hidden_state_sequence_full_v2/train/debug_train_iter%208000%20num_workers%201_hidden_state_enabled%20True/sequence_full_2000/debug/08_28_18_36/model_last.pth) |
 
 ## 4. 五轮整体结果
 
@@ -123,11 +123,11 @@ H-token checkpoint 的第 1 次运行复用此前已经完成的完整评测，�
 
 ## 8. 数据、日志与复核
 
-- H-token 五轮正式汇总：[`data/hidden_state_sequence_eval_repeats_v1/summary_official_5run.json`](../data/hidden_state_sequence_eval_repeats_v1/summary_official_5run.json)
-- 官方 baseline 五轮正式汇总：[`data/official_baseline_eval_5runs_v1/summary_official_5run.json`](../data/official_baseline_eval_5runs_v1/summary_official_5run.json)
-- H-token 评测日志：[`data/hidden_state_sequence_eval_repeats_v1/`](../data/hidden_state_sequence_eval_repeats_v1/)
-- baseline 评测日志：[`data/official_baseline_eval_5runs_v1/`](../data/official_baseline_eval_5runs_v1/)
-- H-token 训练日志：[`data/hidden_state_sequence_full_v2/`](../data/hidden_state_sequence_full_v2/)
-- 旧的 H-token 单次结果汇总（仅作历史记录）：[`data/hidden_state_sequence_eval_v3/summary.json`](../data/hidden_state_sequence_eval_v3/summary.json)
+- H-token 五轮正式汇总：[`outputs/hidden_state_sequence_eval_repeats_v1/summary_official_5run.json`](../outputs/hidden_state_sequence_eval_repeats_v1/summary_official_5run.json)
+- 官方 baseline 五轮正式汇总：[`outputs/official_baseline_eval_5runs_v1/summary_official_5run.json`](../outputs/official_baseline_eval_5runs_v1/summary_official_5run.json)
+- H-token 评测日志：[`outputs/hidden_state_sequence_eval_repeats_v1/`](../outputs/hidden_state_sequence_eval_repeats_v1/)
+- baseline 评测日志：[`outputs/official_baseline_eval_5runs_v1/`](../outputs/official_baseline_eval_5runs_v1/)
+- H-token 训练日志：[`outputs/hidden_state_sequence_full_v2/`](../outputs/hidden_state_sequence_full_v2/)
+- 旧的 H-token 单次结果汇总（仅作历史记录）：[`outputs/hidden_state_sequence_eval_v3/summary.json`](../outputs/hidden_state_sequence_eval_v3/summary.json)
 
 共核验 30 个完整评测 CSV（5 个 H-token checkpoint × 5 次运行 + baseline × 5 次运行），每个 CSV 均包含 18 个 task 行，全部评测退出码为 0。聚焦路线测试 [`tests/test_stage2_hidden_state_route.py`](../tests/test_stage2_hidden_state_route.py) 和相关 Python 语法检查均通过。

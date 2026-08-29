@@ -100,6 +100,8 @@ bash train.sh --mvt_cfg_opts "hidden_state_enabled True" \
 
 该模式继续读取旧的 one-step replay 文件；sequence sampler 会沿 action forward 读取同一 replay task，并用 terminal/timeout/`valid_mask` 阻止跨 episode 展开。`hidden_state_enabled=False` 时仍使用原始 independent-transition 路径。
 
+实验运行产物（checkpoint、日志、评测 CSV、可视化和缓存）建议写入项目根目录的 `outputs/`；该目录已加入 `.gitignore`，不会被 Git 追踪。`data/` 仅保留数据集、replay buffer 和用户提供的模型权重等输入资产。
+
 3. **COLOSSEUM Fine-tuning:** For COLOSSEUM, we fine-tune the model with the training dataset provided by the [COLOSSEUM challenge](https://huggingface.co/datasets/colosseum/colosseum-challenge/tree/main). Similarly, our training code will first convert the raw data into replay buffer. You can also directly download the replay buffer we preprocess [here](https://huggingface.co/datasets/LPY/BridgeVLA_COLOSSEUM_TRAIN_BUFFER/tree/main). Then, you can use the `finetune/Colosseum/train.sh` file to finetune the model. Please run the following code:
 ```bash
 cd finetune/Colosseum
