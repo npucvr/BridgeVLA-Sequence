@@ -84,6 +84,22 @@ bash train.sh --exp_cfg_path  configs/rlbench_config.yaml \
               --load_pretrain \
               --pretrain_path  PATH_TO_PRETRAINED_MODEL 
 ```
+
+如需运行新的 H-token hidden-state 路由，应从已训练的 BridgeVLA checkpoint 开始，并显式开启按时间顺序的 sequence trainer：
+
+```bash
+cd finetune/RLBench
+bash train.sh --mvt_cfg_opts "hidden_state_enabled True" \
+              --hidden_state_route_only \
+              --init_checkpoint PATH_TO_BRIDGEVLA_CHECKPOINT \
+              --hidden_state_sequence_training \
+              --hidden_state_sequence_length 4 \
+              --exp_note hidden_state_sequence \
+              --log_dir PATH_TO_LOG_DIR
+```
+
+该模式继续读取旧的 one-step replay 文件；sequence sampler 会沿 action forward 读取同一 replay task，并用 terminal/timeout/`valid_mask` 阻止跨 episode 展开。`hidden_state_enabled=False` 时仍使用原始 independent-transition 路径。
+
 3. **COLOSSEUM Fine-tuning:** For COLOSSEUM, we fine-tune the model with the training dataset provided by the [COLOSSEUM challenge](https://huggingface.co/datasets/colosseum/colosseum-challenge/tree/main). Similarly, our training code will first convert the raw data into replay buffer. You can also directly download the replay buffer we preprocess [here](https://huggingface.co/datasets/LPY/BridgeVLA_COLOSSEUM_TRAIN_BUFFER/tree/main). Then, you can use the `finetune/Colosseum/train.sh` file to finetune the model. Please run the following code:
 ```bash
 cd finetune/Colosseum

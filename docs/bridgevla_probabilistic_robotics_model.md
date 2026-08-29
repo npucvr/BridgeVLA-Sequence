@@ -189,24 +189,32 @@ $$
 
 因此，$F_\phi$ 的训练需要跨多个连续 decision 展开；独立 transition replay 不能验证完整的 sequence-training 梯度。
 
-## 5. 当前实现边界
+## 5. 当前实现与边界
 
-当前代码实现的是轻量路由：
+当前 hidden-state 路由已经按完整的 predict–observe–correct 顺序接入：
 
 $$
- z_t\xrightarrow{\mathrm{PaliGemma}}H_t
- \xrightarrow{A_\psi(\cdot,y_t)}\widetilde H_t,
+ H_t=\mathrm{PaliGemma}(z_t,l),
  \qquad
- y_{t+1}=F_\phi(y_t,u_t).
+ y_t^-=F_\phi(y_{t-1},u_{t-1}),
+ \qquad
+ y_t=U_\omega(y_t^-,H_t),
 $$
 
-因此，当前动作仍然可以通过 PaliGemma 看到最新观测 $z_t$；但 $z_t$ 尚未通过 $U_\omega$ 写回未来的 hidden state。这正是轻量实现与完整 predict–observe–correct 模型之间的差距，而不是环境观测模型本身的断裂。
+$$
+ \widetilde H_t=H_t+A_\psi(H_t,y_t),
+ \qquad
+ u_t=\pi_\theta(\widetilde H_t,y_t,l).
+$$
 
-当前尚未实现：
+代码中的 `U_omega` 使用一个由 $y_t^-$ 产生的 query 对当前 PaliGemma visual tokens 做 cross-attention，再由 `GRUCell` 完成 observation update；token 的处理封装在 `U_omega` 内，而不是把 RGB 直接传入 update。策略还通过轻量 residual head 显式接收 $y_t$。RLBench 的 sequence sampler 按 replay 中的 forward action 顺序采样，并以 terminal/timeout 和 `valid_mask` 阻止跨 episode 展开；`RVTAgent.update_sequence()` 在单次 optimizer step 中反向传播整段 recurrence，因此 `F_\phi` 与 `U_\omega` 都参与序列梯度。
 
-- 使用当前 RLBench 观测更新 $y_t$ 的 $U_\omega$；
+sequence update 会冻结 `BatchNorm` 运行统计，并关闭 DDP 对模块 buffer 的逐步广播，以避免累积多个时间步的反向图时发生 buffer 版本变化。
+
+当前仍未实现：
+
 - observation decoder $p_\eta(z\mid y)$；
 - 基于真实 simulator state 的 $\mathcal L_x$；
-- 完整的 episode-level sequence training。
+- 以 episode 初始状态为起点的全 episode hidden-state burn-in（目前使用固定长度窗口并从零 prior 开始）。
 
-关闭 `hidden_state_enabled` 时仍保持原始 BridgeVLA checkpoint 的严格加载兼容性。历史 token-window、cache 和 temporal-loss 路径不属于当前接口。
+`hidden_state_enabled=False` 时不注册新增路由模块，原始 BridgeVLA 的 checkpoint keys 与默认 forward path 保持兼容。新路由使用 `hidden_state_sequence_training=True` 和 `hidden_state_sequence_length` 开启；默认仍是旧的 independent-transition trainer。
