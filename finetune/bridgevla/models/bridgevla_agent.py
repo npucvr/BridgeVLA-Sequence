@@ -1032,6 +1032,9 @@ class RVTAgent:
             img_feat=img_feat,
             img_aug=0,  # no img augmentation while acting
             language_goal=language_goal,
+            # gbw____
+            temporal_step=step,
+            # ____
         )
         if visualize:
             q_trans, rot_q, grip_q, collision_q, y_q, _ = self.get_q(
@@ -1105,6 +1108,10 @@ class RVTAgent:
         pred_wpt_local = self._net_mod.get_wpt(
             out, mvt1_or_mvt2, dyn_cam_info, y_q
         )
+        # gbw____
+        if not self.stage_two:
+            self._net_mod.record_waypoint_diagnostics(pred_wpt_local, stage=1)
+        # ____
 
         pred_wpt = []
         for _pred_wpt_local, _rev_trans in zip(pred_wpt_local, rev_trans):
@@ -1183,7 +1190,24 @@ class RVTAgent:
 
 
     def reset(self):
-        pass
+        # gbw____
+        # agent.reset() 是 episode 开始时的生命周期入口，向下转发到 MVT，
+        # 最终清除 A1 的 temporal token state。
+        # ____
+        # gbw____
+        if hasattr(self._net_mod, "reset_temporal_state"):
+            self._net_mod.reset_temporal_state(reason="agent_reset")
+        # ____
+
+    # gbw____
+    def end_episode(self, reason: str):
+        # gbw____
+        # evaluator 在 task switch、terminal、timeout 时调用 end_episode()，
+        # 防止 A1 把上一条 episode 的状态带到下一条轨迹。
+        # ____
+        if hasattr(self._net_mod, "reset_temporal_state"):
+            self._net_mod.reset_temporal_state(reason=reason)
+    # ____
 
     def eval(self):
         self._network.eval()

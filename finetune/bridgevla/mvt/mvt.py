@@ -143,9 +143,9 @@ class MVT(nn.Module):
         """
         assert isinstance(mvt1_or_mvt2, bool)
         if mvt1_or_mvt2:
-            wpt = self.mvt1.get_wpt(
-                out, dyn_cam_info, y_q,
-            )
+            # gbw____
+            wpt = self.mvt1.get_wpt(out, dyn_cam_info, y_q)
+            # ____
         else:
             assert self.stage_two
             wpt = self.mvt1.get_wpt(
@@ -350,9 +350,21 @@ class MVT(nn.Module):
             rot_x_y=rot_x_y,
             language_goal=language_goal,
             forward_no_feat=True,
+            # gbw____
+            filter_stage=1,
+            # ____
             # forward_no_feat=False,
             **kwargs,
         )
+        # gbw____
+        # Stage-1 是默认的 A1 过滤位置。mvt_single.forward() 内部完成
+        # image-token 提取、AKF 更新和 ConvexUpSample；这里负责把 stage=1 传下去。
+        # ____
+        # gbw____
+        stage1_filter_diagnostics = self.mvt1.get_filt3r_diagnostics()
+        if stage1_filter_diagnostics is not None:
+            out["filt3r_diagnostics"] = stage1_filter_diagnostics
+        # ____
         out["mvt1_ori_img"]=img.clone().detach()
         def visualize_tensor(tensor, save_path=None):
             """
@@ -414,10 +426,20 @@ class MVT(nn.Module):
 
                 else:
                     # bs, 3
+                    # gbw____
                     wpt_local = self.get_wpt(
                         out, y_q=None, mvt1_or_mvt2=True,
                         dyn_cam_info=None,
                     )
+                    # ____
+                    # gbw____
+                    # 通过 MVT 的转发函数记录，确保把同一帧的 raw shadow waypoint
+                    # 一并传给诊断；直接调用 mvt1 会丢失这个旁路值。
+                    # ____
+                    self.record_waypoint_diagnostics(
+                        waypoint=wpt_local, stage=1
+                    )
+                    # ____
                     pc, rev_trans = mvt_utils.trans_pc(
                         pc, loc=wpt_local, sca=self.st_sca
                     )
@@ -441,8 +463,15 @@ class MVT(nn.Module):
                 rot_x_y=rot_x_y,
                 language_goal=language_goal,
                 forward_no_feat=False,
+                # gbw____
+                filter_stage=2,
+                # ____
                 **kwargs,
             )
+            # gbw____
+            # 默认 FILT3R_STAGES=1，因此 Stage-2 不执行 A1 filter，保持 raw baseline。
+            # 即使显式打开 Stage-2，也仍然调用同一个 filter 对象和同一套算法。
+            # ____
 
             out["wpt_local1"] = wpt_local_stage_one_noisy
             out["rev_trans"] = rev_trans 
@@ -450,6 +479,23 @@ class MVT(nn.Module):
             out["mvt2_ori_img"]=img.clone().detach()
 
         return out
+
+    # gbw____
+    def reset_temporal_state(self, reason="agent_reset"):
+        # gbw____
+        # MVT 只做一层转发；真正清除 state 的代码在 mvt_single.py/filt3r_akf.py。
+        # ____
+        return self.mvt1.reset_temporal_state(reason=reason)
+
+    # gbw____
+    def record_waypoint_diagnostics(self, waypoint, stage=1):
+        raw_waypoint = self.mvt1.get_filt3r_raw_shadow_waypoint()
+        return self.mvt1.record_waypoint_diagnostics(
+            waypoint,
+            stage=stage,
+            raw_waypoint=raw_waypoint,
+        )
+    # ____
 
 
 

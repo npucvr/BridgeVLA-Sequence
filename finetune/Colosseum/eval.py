@@ -22,10 +22,21 @@ import csv
 import torch
 import cv2
 import shutil
+# gbw____
+import numbers
+# ____
 import numpy as np
 from omegaconf import OmegaConf
 from multiprocessing import Value
-from tensorflow.python.summary.summary_iterator import summary_iterator
+# gbw____
+# summary_iterator is not used by this evaluator.  Keep the optional import
+# for environments that provide TensorFlow, but do not make Colosseum A0
+# depend on an unrelated TensorFlow installation.
+try:
+    from tensorflow.python.summary.summary_iterator import summary_iterator
+except ModuleNotFoundError:
+    summary_iterator = None
+# ____
 from copy import deepcopy
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -291,6 +302,17 @@ def eval(
         # report summaries
         summaries = []
         summaries.extend(stats_accumulator.pop())
+        # gbw____
+        # YARR 的 _SimpleAccumulator.pop() 只有在累计超过一个完整 episode
+        # 时才返回统计结果。官方 workaround 为了逐 trial 重试而使用
+        # eval_episodes=1，此时 episode 已经完成，但 pop() 会返回空列表，
+        # 进而把真实 reward 错误地写成 unknown。peak() 只读取当前已完成
+        # episode 的统计；随后 reset() 保证本进程不会把本 task 的状态带到
+        # 后续 task。该兼容逻辑不改变 rollout、动作或 reward。
+        if not summaries and task_rewards:
+            summaries.extend(stats_accumulator.peak())
+            stats_accumulator.reset()
+        # ____
         task_name = tasks[task_id]
         if logging:
             # writer csv first
@@ -325,8 +347,14 @@ def eval(
         scores.append(task_score)
 
         if save_video:
-            video_image_folder = f"./tmp/{task_name}"
-            palette_image_folder = f"./tmp/palette_folder"
+            # gbw____
+            # 多个 repeat 并行时不能共享 cwd 下的 ./tmp；否则不同进程会
+            # 同时删除/覆盖同一个 task 的帧和 palette。每个 eval 的 log_dir
+            # 已按 repeat/task 隔离，因此把视频临时文件放到该目录下。
+            video_tmp_root = os.path.join(log_dir or ".", "video_tmp")
+            video_image_folder = os.path.join(video_tmp_root, task_name)
+            palette_image_folder = os.path.join(video_tmp_root, "palette_folder")
+            # ____
             palette_image_path=os.path.join(palette_image_folder,"palette.png")
             num_succ_video = 25
             num_fail_video = 25
@@ -377,8 +405,13 @@ def eval(
                         )
 
                         print(f'video saved - {task_name}')
-                        os.remove(palette_image_path)
-                        shutil.rmtree(video_image_folder)
+                        # gbw____
+                        # ffmpeg 失败时 palette 可能不存在；清理只能作用于
+                        # 当前进程自己的临时目录，不能因清理异常中断整个 eval。
+                        # ____
+                        if os.path.exists(palette_image_path):
+                            os.remove(palette_image_path)
+                        shutil.rmtree(video_image_folder, ignore_errors=True)
 
     eval_env.shutdown()
 
@@ -451,7 +484,26 @@ def _eval(args):
     for i in range(len(tasks_to_eval)):
         task_scores[tasks_to_eval[i]] = scores[i]
     print("avg score: ", task_scores)
-    tb.update("eval", model_idx, task_scores)
+    # gbw____
+    # 某个 episode 若确实在 reset 阶段失败，task_score 可能为
+    # ``unknown``。它应由 workaround 作为 invalid trial 重试，而不是
+    # 让 TensorBoard 的 float() 转换再次把整个评测进程打崩。
+    numeric_task_scores = {
+        key: value
+        for key, value in task_scores.items()
+        if isinstance(value, numbers.Real)
+        and np.isfinite(float(value))
+    }
+    dropped_task_scores = [
+        key for key in task_scores if key not in numeric_task_scores
+    ]
+    if dropped_task_scores:
+        print(
+            "[Evaluation] no numeric score for "
+            f"{dropped_task_scores}; these trials are not valid workaround samples."
+        )
+    tb.update("eval", model_idx, numeric_task_scores)
+    # ____
     tb.writer.flush()
 
     tb.close()

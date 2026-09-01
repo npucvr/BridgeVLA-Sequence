@@ -62,6 +62,54 @@ from bridgevla.utils.rvt_utils import (
 from bridgevla.utils.rvt_utils import load_agent as load_agent_state
 import os 
 
+# gbw____
+def _natural_episode_ids(eval_datafolder, task_name):
+    episode_root = os.path.join(
+        eval_datafolder, task_name, "all_variations", "episodes"
+    )
+    episode_ids = []
+    for entry in os.listdir(episode_root):
+        if not entry.startswith("episode"):
+            continue
+        suffix = entry[len("episode"):]
+        if suffix.isdigit() and os.path.isdir(os.path.join(episode_root, entry)):
+            episode_ids.append(int(suffix))
+    return sorted(episode_ids)
+
+
+def _build_eval_episode_plan(
+    eval_datafolder, tasks, start_episode, eval_episodes, eval_seed
+):
+    rng = np.random.RandomState(eval_seed) if eval_seed is not None else None
+    plan = {}
+    for task_name in tasks:
+        episode_ids = _natural_episode_ids(eval_datafolder, task_name)
+        if eval_seed is None:
+            positions = list(range(start_episode, start_episode + eval_episodes))
+        else:
+            if eval_episodes > len(episode_ids):
+                raise RuntimeError(
+                    f"Task {task_name} has {len(episode_ids)} stored episodes, "
+                    f"but {eval_episodes} are required for seed {eval_seed}."
+                )
+            positions = rng.choice(
+                len(episode_ids), size=eval_episodes, replace=False
+            ).tolist()
+        if positions and max(positions) >= len(episode_ids):
+            raise RuntimeError(
+                f"Task {task_name} has {len(episode_ids)} stored episodes, "
+                f"but evaluation requested position {max(positions)}."
+            )
+        plan[task_name] = [
+            {
+                "dataset_position": int(position),
+                "dataset_episode": int(episode_ids[position]),
+            }
+            for position in positions
+        ]
+    return plan
+# ____
+
 def load_agent(
     model_path=None,
     exp_cfg_path=None,
@@ -151,8 +199,25 @@ def eval(
     model_name="debug",
     visualize=False,
     visualize_root_dir="",
+    # gbw___
+    save_multiview=False,
+    multiview_dir="",
+    multiview_resolution=256,
+    #____
+    # gbw____
+    eval_seed=None,
+    episode_selection_path=None,
+    episode_selection_input_path=None,
+    # ____
 ):
     agent.eval()
+    # gbw___
+    if save_multiview:
+        from multiview_video import MultiviewRecorder
+
+        if not multiview_dir:
+            raise ValueError("multiview_dir is required when save_multiview=True")
+    #____
 
     camera_resolution = [IMAGE_SIZE, IMAGE_SIZE]
     obs_config = utils.create_obs_config(CAMERAS, camera_resolution, method_name="")
@@ -172,6 +237,57 @@ def eval(
         tasks = RLBENCH_TASKS
         if verbose:
             print(f"evaluate on {len(tasks)} tasks: ", tasks)
+
+    # gbw____
+    if episode_selection_input_path:
+        import json
+
+        with open(episode_selection_input_path) as selection_fp:
+            source_selection = json.load(selection_fp)
+        source_plan = source_selection.get("plan")
+        if not isinstance(source_plan, dict):
+            raise ValueError(
+                f"episode selection source has no plan: {episode_selection_input_path}"
+            )
+        missing_tasks = [task for task in tasks if task not in source_plan]
+        if missing_tasks:
+            raise ValueError(
+                "episode selection source is missing tasks: "
+                f"{missing_tasks} ({episode_selection_input_path})"
+            )
+        for task in tasks:
+            if len(source_plan[task]) < start_episode + eval_episodes:
+                raise ValueError(
+                    f"episode selection source has too few episodes for {task}: "
+                    f"need {start_episode + eval_episodes}, "
+                    f"found {len(source_plan[task])}"
+                )
+        episode_plan = source_plan
+    else:
+        episode_plan = _build_eval_episode_plan(
+            eval_datafolder=eval_datafolder,
+            tasks=tasks,
+            start_episode=start_episode,
+            eval_episodes=eval_episodes,
+            eval_seed=eval_seed,
+        )
+    # ____
+    if episode_selection_path:
+        with open(episode_selection_path, "w") as selection_fp:
+            import json
+
+            json.dump(
+                {
+                    "eval_seed": eval_seed,
+                    "start_episode": start_episode,
+                    "eval_episodes": eval_episodes,
+                    "tasks": tasks,
+                    "plan": episode_plan,
+                },
+                selection_fp,
+                indent=2,
+            )
+    # ____
 
     for task in tasks:
         if task not in task_files:
@@ -211,6 +327,14 @@ def eval(
     stats_accumulator = SimpleAccumulator(eval_video_fps=30)
 
     eval_env.launch()
+    # gbw___
+    multiview_recorder = None
+    if save_multiview:
+        multiview_recorder = MultiviewRecorder(
+            eval_env, resolution=multiview_resolution
+        )
+        eval_env.register_callback(multiview_recorder.callback)
+    #____
 
     current_task_id = -1
 
@@ -219,10 +343,30 @@ def eval(
 
     scores = []
     for task_id in range(num_tasks):
+        # gbw____
+        # 任务切换也是 A1 temporal state 的边界，即使后面第一条 episode 通常还会
+        # 调用 agent.reset()，这里仍显式清理，避免 task 间 state 泄漏。
+        # The following episode reset is also sufficient in the common case,
+        # but task changes get an explicit temporal-state boundary as well.
+        if task_id > 0 and hasattr(agent, "end_episode"):
+            agent.end_episode("task_switch")
+        # ____
         task_rewards = []
         language_goals=[]
-        for ep in range(start_episode, start_episode + eval_episodes):
+        # gbw____
+        task_name = tasks[task_id]
+        # ____
+        # gbw____
+        for episode_offset, episode_spec in enumerate(episode_plan[task_name]):
+            ep = start_episode + episode_offset
+            demo_episode = episode_spec["dataset_episode"]
+            demo_position = episode_spec["dataset_position"]
+        # ____
             episode_rollout = []
+            # gbw___
+            if save_multiview:
+                multiview_recorder.begin_episode()
+            #____
             if not visualize:
                 generator = rollout_generator.generator(
                     step_signal=step_signal,
@@ -231,7 +375,9 @@ def eval(
                     episode_length=episode_length,
                     timesteps=1,
                     eval=True,
-                    eval_demo_seed=ep,
+                    # gbw____
+                    eval_demo_seed=demo_position,
+                    # ____
                     record_enabled=False,
                     replay_ground_truth=replay_ground_truth,
                 )
@@ -248,7 +394,9 @@ def eval(
                     episode_length=episode_length,
                     timesteps=1,
                     eval=True,
-                    eval_demo_seed=ep,
+                    # gbw____
+                    eval_demo_seed=demo_position,
+                    # ____
                     record_enabled=True,
                     visualize_save_dir=visualize_save_dir,
                     visualize=True,
@@ -263,6 +411,37 @@ def eval(
                 eval_env.shutdown()
                 raise e
 
+            # gbw____
+            # The evaluation launcher imports YARR from a read-only reference
+            # checkout. Clear the working-tree adapter here, after the final
+            # transition has been consumed, instead of changing that checkout.
+            if episode_rollout:
+                last_transition = episode_rollout[-1]
+                # gbw____
+                # 一条轨迹以 terminal 或 timeout 结束时清空 A1 state；下一条 episode
+                # 的第一帧重新执行 S_0=Z_0，而不是沿用上一条轨迹的最后状态。
+                # ____
+                if (last_transition.terminal or last_transition.timeout) and hasattr(
+                    agent, "end_episode"
+                ):
+                    agent.end_episode(
+                        "timeout" if last_transition.timeout else "terminal"
+                    )
+            # ____
+
+            # gbw___
+            if save_multiview:
+                multiview_recorder.append_current_frame()
+                multiview_metadata = multiview_recorder.save_episode(
+                    os.path.join(
+                        multiview_dir,
+                        f"{tasks[task_id]}_episode_{ep}.mp4",
+                    ),
+                )
+                if verbose:
+                    print(f"Multiview video: {multiview_metadata}")
+            #____
+
             for transition in episode_rollout:
                 stats_accumulator.step(transition, True)
                 current_task_id = transition.info["active_task_id"]
@@ -275,7 +454,9 @@ def eval(
             language_goals.append(lang_goal)
             if verbose:
                 print(
-                    f"Evaluating {task_name} | Episode {ep} | Score: {reward} | Episode Length: {len(episode_rollout)} | Lang Goal: {lang_goal}"
+                    # gbw____
+                    f"Evaluating {task_name} | Episode {ep} | Demo Episode {demo_episode} | Score: {reward} | Episode Length: {len(episode_rollout)} | Lang Goal: {lang_goal}"
+                    # ____
                 )
 
         # report summaries
@@ -287,7 +468,13 @@ def eval(
             with open(os.path.join(log_dir, csv_file), "a") as csv_fp:
                 fieldnames = ["task", "success rate", "length", "total_transitions"]
                 csv_writer = csv.DictWriter(csv_fp, fieldnames=fieldnames)
-                csv_results = {"task": task_name}
+                # gbw___
+                csv_results = {
+                    "task": task_name,
+                    "success rate": float(np.mean(task_rewards))
+                    if task_rewards else "",
+                }
+                #____
                 for s in summaries:
                     if s.name == "eval_envs/return":
                         csv_results["success rate"] = s.value
@@ -308,7 +495,9 @@ def eval(
                 s.value for s in summaries if f"eval_envs/return/{task_name}" in s.name
             ][0]
         else:
-            task_score = "unknown"
+            # gbw___
+            task_score = float(np.mean(task_rewards)) if task_rewards else "unknown"
+            #____
 
         print(f"[Evaluation] Finished {task_name} | Final Score: {task_score}\n")
 
@@ -355,15 +544,19 @@ def eval(
                         )
                     images_path = os.path.join(video_image_folder, r"%d.png")
                     os.system(
+                        # gbw___
                         "ffmpeg -i {} -vf palettegen {} -hide_banner -loglevel error".format(
                             images_path, palette_image_path
                         )
+                        #____
                     )
                     
                     os.system(
-                        "ffmpeg -framerate {} -i {} -i {} -lavfi paletteuse {} -hide_banner -loglevel error".format(
+                        # gbw___
+                        "ffmpeg -y -framerate {} -i {} -i {} -lavfi paletteuse {} -hide_banner -loglevel error".format(
                             record_fps, images_path, palette_image_path, video_path
                         )
+                        #____
                     )
                     print(f'video saved - {task_name}')
                     os.remove(palette_image_path)

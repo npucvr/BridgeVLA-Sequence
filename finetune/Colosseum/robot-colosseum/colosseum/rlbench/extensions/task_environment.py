@@ -44,10 +44,20 @@ class TaskEnvironmentExt(TaskEnvironment):
             if self._dataset_root is None or len(self._dataset_root) == 0:
                 raise RuntimeError(
                     "Can't ask for stored demo when no dataset root provided.")
+            # gbw____
+            # Colosseum evaluation archives in this workspace contain the
+            # low-dimensional demo state and four rendered-camera folders,
+            # but no RLBench ``overhead_*`` folders.  Evaluation only needs
+            # the demo state to restore the scene; current observations are
+            # rendered by CoppeliaSim from the active ObservationConfig.
+            # Keeping image loading disabled also avoids changing the shared
+            # RLBench loader used by the other benchmarks.
+            # ____
             demos = utils.get_stored_demos(
                 amount, image_paths, self._dataset_root, self._variation_number,
                 self._task.task_path, self._obs_config,
-                random_selection, from_episode_number)
+                random_selection, from_episode_number,
+                load_images=False)
         else:
             ctr_loop = self._robot.arm.joints[0].is_control_loop_enabled()
             self._robot.arm.set_control_loop_enabled(True)

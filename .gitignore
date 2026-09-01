@@ -1,0 +1,19 @@
+/data/
+/docs/
+/migration/
+/outputs/
+/tests/
+__pycache__/
+*.py[cod]
+/finetune/RLBench/run_*.py
+finetune/RLBench/archive/
+*.tar.gz
+*.pyc
+
+AGENTS.md
+
+# Local simulation/runtime dependencies
+/finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04/
+/finetune/user_xvfb/
+/finetune/bridgevla/libs/PyRep/
+/finetune/bridgevla/libs/RLBench/
