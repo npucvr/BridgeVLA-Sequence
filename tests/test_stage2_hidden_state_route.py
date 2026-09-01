@@ -37,7 +37,7 @@ class _FakeReplay:
     _store = {
         "action": np.arange(10, dtype=np.float32).reshape(5, 2),
         "reward": np.arange(5, dtype=np.float32),
-        "terminal": np.asarray([0, 0, 1, 0, -1], dtype=np.int8),
+        "terminal": np.asarray([0, 0, 1, 1, -1], dtype=np.int8),
         "timeout": np.zeros(5, dtype=bool),
         "observation": np.arange(5, dtype=np.float32).reshape(5, 1),
     }
@@ -196,4 +196,66 @@ def test_sequence_replay_is_forward_and_masks_terminal_padding():
     np.testing.assert_array_equal(
         timeout_batch["valid_mask"],
         np.asarray([[1, 1, 0, 0], [1, 0, 0, 0]], dtype=np.float32),
+    )
+
+
+def test_sequence_replay_burn_in_warms_target_without_crossing_episode():
+    replay = _FakeReplay()
+    sequence = SequenceReplayBuffer(
+        replay,
+        sequence_length=3,
+        burn_in_length=2,
+    )
+    batch = sequence.sample_transition_batch(indices=[1, 3])
+
+    np.testing.assert_array_equal(
+        batch["valid_mask"],
+        np.asarray(
+            [[0, 1, 1, 1, 0], [0, 0, 1, 0, 0]],
+            dtype=np.float32,
+        ),
+    )
+    np.testing.assert_array_equal(
+        batch["loss_mask"],
+        np.asarray(
+            [[0, 0, 1, 1, 0], [0, 0, 1, 0, 0]],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_full_episode_sampler_starts_once_and_pads_after_terminal():
+    replay = _FakeReplay()
+    sequence = SequenceReplayBuffer(
+        replay,
+        sequence_length=4,
+        full_episode=True,
+    )
+    batch = sequence.sample_transition_batch(indices=[0, 3])
+
+    assert batch["observation"].shape == (2, 3, 1)
+    np.testing.assert_array_equal(
+        batch["valid_mask"],
+        np.asarray([[1, 1, 1], [1, 0, 0]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        batch["loss_mask"], batch["valid_mask"]
+    )
+    np.testing.assert_array_equal(
+        batch["episode_lengths"], np.asarray([3, 1], dtype=np.int32)
+    )
+
+
+def test_one_step_transition_detaches_old_posterior_but_keeps_f_gradients():
+    transition = F_phi(hidden_dim=8, action_dim=4)
+    posterior = torch.randn(2, 8, requires_grad=True)
+    actions = torch.randn(2, 4)
+
+    next_prior = transition(posterior.detach(), actions)
+    next_prior.square().mean().backward()
+
+    assert posterior.grad is None
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0
+        for parameter in transition.parameters()
     )
