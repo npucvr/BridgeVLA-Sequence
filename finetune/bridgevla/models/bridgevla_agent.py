@@ -894,6 +894,11 @@ class RVTAgent:
                 return_out["_loss_tensor"] = total_loss
                 return_out["_hidden_state_y"] = out.get("hidden_state_y")
 
+        # Burn-in forwards request the posterior without constructing or
+        # optimizing an action loss.  Keep the same internal return contract
+        # so the sequence trainer can warm the recurrent state.
+        if _return_internal and "_hidden_state_y" not in return_out:
+            return_out["_hidden_state_y"] = out.get("hidden_state_y")
 
         return return_out
 
@@ -902,7 +907,17 @@ class RVTAgent:
     def _slice_sequence_sample(replay_sample, timestep, sequence_length):
         """Extract one ``[B, 1, ...]`` transition from a sequence batch."""
         step_sample = {}
-        sequence_metadata = {"valid_mask", "indices", "terminal", "timeout", "reward"}
+        sequence_metadata = {
+            "valid_mask",
+            "loss_mask",
+            "indices",
+            "episode_lengths",
+            "episode_starts",
+            "episode_ends",
+            "terminal",
+            "timeout",
+            "reward",
+        }
         for key, value in replay_sample.items():
             if key in sequence_metadata:
                 continue
@@ -956,30 +971,42 @@ class RVTAgent:
         replay_sample: dict,
         backprop: bool = True,
         reset_log: bool = False,
+        bptt_length: int = 1,
     ) -> dict:
-        """Train the H-token route on chronological replay sequences.
+        """Train chronological episodes with truncated action-loss gradients.
 
-        Each valid step runs the ordinary BridgeVLA action objective.  The
-        posterior returned by ``U_omega`` is then passed, without detaching, to
-        ``F_phi`` together with the demonstrated action before the next step.
-        This is the differentiable recurrence that the independent transition
-        trainer cannot provide.
+        ``valid_mask`` controls which records advance the recurrent state and
+        ``loss_mask`` optionally marks a legacy no-loss burn-in prefix.  In the
+        normal full-episode path, the state is initialized once at the episode
+        start and then carried through every valid record.  ``bptt_length``
+        controls gradient truncation; with the default one-step setting the
+        posterior is detached before ``F_phi`` while ``F_phi`` itself remains
+        grad-enabled, so the next action loss trains the one-step transition
+        without backpropagating through older observations.
         """
         if not self._hidden_state_enabled:
             raise ValueError("update_sequence requires hidden_state_enabled=True")
         if not backprop:
             raise ValueError("update_sequence requires backprop=True")
+        if int(bptt_length) < 1:
+            raise ValueError("bptt_length must be at least 1")
+        bptt_length = int(bptt_length)
         if "valid_mask" not in replay_sample or "action" not in replay_sample:
             raise ValueError(
                 "sequence batches must contain valid_mask and action fields"
             )
 
         valid_mask = replay_sample["valid_mask"]
+        loss_mask = replay_sample.get("loss_mask", valid_mask)
         action_sequence = replay_sample["action"]
         if not isinstance(valid_mask, torch.Tensor):
             valid_mask = torch.as_tensor(valid_mask, device=self._device)
         else:
             valid_mask = valid_mask.to(self._device)
+        if not isinstance(loss_mask, torch.Tensor):
+            loss_mask = torch.as_tensor(loss_mask, device=self._device)
+        else:
+            loss_mask = loss_mask.to(self._device)
         if not isinstance(action_sequence, torch.Tensor):
             action_sequence = torch.as_tensor(action_sequence, device=self._device)
         else:
@@ -990,6 +1017,13 @@ class RVTAgent:
                 "valid_mask must have shape [B, L], got "
                 f"{tuple(valid_mask.shape)}"
             )
+        if loss_mask.shape != valid_mask.shape:
+            raise ValueError(
+                "loss_mask and valid_mask shapes disagree: "
+                f"loss={tuple(loss_mask.shape)}, valid={tuple(valid_mask.shape)}"
+            )
+        if torch.any(loss_mask < 0) or torch.any(loss_mask > valid_mask):
+            raise ValueError("loss_mask must satisfy 0 <= loss_mask <= valid_mask")
         if action_sequence.ndim != 3:
             raise ValueError(
                 "sequence action must have shape [B, L, A], got "
@@ -1019,66 +1053,126 @@ class RVTAgent:
         accumulated_loss = None
         accumulated_weight = valid_mask.new_zeros(())
         weighted_log = {}
+        target_steps_seen = 0
 
         for timestep in range(sequence_length):
-            timestep_mask = valid_mask[:, timestep].float()
-            active_rows = timestep_mask.bool()
+            valid_step_mask = valid_mask[:, timestep].float()
+            active_rows = valid_step_mask.bool()
             if active_rows.sum().item() == 0:
                 break
+            step_loss_mask = loss_mask[:, timestep].float()[active_rows]
             step_sample = self._slice_sequence_sample(
                 replay_sample, timestep, sequence_length
             )
             step_sample = self._select_sequence_rows(step_sample, active_rows)
             active_indices = active_rows.nonzero(as_tuple=False).squeeze(-1)
-            step_output = self.update(
-                replay_sample=step_sample,
-                backprop=True,
-                reset_log=reset_log and timestep == 0,
-                _hidden_state_override=hidden_state[active_rows],
-                _loss_weight=None,
-                _optimizer_step=False,
-                _return_internal=True,
-                _manage_log=False,
-            )
+            has_loss = step_loss_mask.sum().item() > 0
+            if has_loss:
+                target_steps_seen += 1
+
+            if has_loss:
+                step_output = self.update(
+                    replay_sample=step_sample,
+                    backprop=True,
+                    reset_log=reset_log and timestep == 0,
+                    _hidden_state_override=hidden_state[active_rows],
+                    _loss_weight=step_loss_mask,
+                    _optimizer_step=False,
+                    _return_internal=True,
+                    _manage_log=False,
+                )
+            else:
+                # Burn-in warms the posterior from preceding observations and
+                # demonstrated actions, but contributes neither loss nor graph.
+                with torch.no_grad():
+                    step_output = self.update(
+                        replay_sample=step_sample,
+                        backprop=False,
+                        reset_log=False,
+                        _hidden_state_override=hidden_state[active_rows],
+                        _loss_weight=None,
+                        _optimizer_step=False,
+                        _return_internal=True,
+                        _manage_log=False,
+                    )
+
             step_loss = step_output.get("_loss_tensor")
             posterior = step_output.get("_hidden_state_y")
-            if step_loss is None or posterior is None:
+            if posterior is None:
                 raise RuntimeError(
                     "hidden-state sequence update did not return U_omega posterior"
                 )
+            if has_loss:
+                if step_loss is None:
+                    raise RuntimeError(
+                        "target sequence update did not return an action loss"
+                    )
+                weight = step_loss_mask.sum()
+                weighted_step_loss = step_loss * weight
+                accumulated_loss = (
+                    weighted_step_loss
+                    if accumulated_loss is None
+                    else accumulated_loss + weighted_step_loss
+                )
+                accumulated_weight = accumulated_weight + weight
+                for key, value in step_output.items():
+                    if key in {
+                        "total_loss",
+                        "trans_loss",
+                        "rot_loss_x",
+                        "rot_loss_y",
+                        "rot_loss_z",
+                        "grip_loss",
+                        "collision_loss",
+                    }:
+                        weighted_log[key] = weighted_log.get(key, 0.0) + value * weight.item()
 
-            weight = timestep_mask.sum()
-            weighted_step_loss = step_loss * weight
-            accumulated_loss = (
-                weighted_step_loss
-                if accumulated_loss is None
-                else accumulated_loss + weighted_step_loss
-            )
-            accumulated_weight = accumulated_weight + weight
-            for key, value in step_output.items():
-                if key.endswith("_loss"):
-                    weighted_log[key] = weighted_log.get(key, 0.0) + value * weight.item()
             if timestep + 1 < sequence_length:
-                next_hidden_state = self._net_mod.update_hidden_state(
-                    posterior,
-                    action_sequence[active_rows, timestep],
-                )
-                # Scatter the active rows back into the full batch without an
-                # in-place write, preserving the graph through F_phi.
-                candidate_hidden_state = hidden_state.index_copy(
-                    0,
-                    active_indices,
-                    next_hidden_state,
-                )
-                next_valid = valid_mask[:, timestep + 1].bool().unsqueeze(-1)
-                hidden_state = torch.where(
-                    next_valid,
-                    candidate_hidden_state,
-                    hidden_state,
-                )
+                next_valid_rows = active_rows & valid_mask[:, timestep + 1].bool()
+                active_next_mask = next_valid_rows[active_indices]
+                if active_next_mask.any().item():
+                    next_indices = active_indices[active_next_mask]
+                    next_posterior = posterior[active_next_mask]
+                    next_actions = action_sequence[next_indices, timestep]
+                    if has_loss:
+                        if bptt_length == 1:
+                            # Keep the numerical state continuous, but cut the
+                            # older U_omega graph before the one-step transition.
+                            # F_phi must remain grad-enabled: the next action
+                            # loss is its only supervision on this route.
+                            transition_input = next_posterior.detach()
+                            next_hidden_state = self._net_mod.update_hidden_state(
+                                transition_input,
+                                next_actions,
+                            )
+                        else:
+                            next_hidden_state = self._net_mod.update_hidden_state(
+                                next_posterior,
+                                next_actions,
+                            )
+                            if target_steps_seen % bptt_length == 0:
+                                next_hidden_state = next_hidden_state.detach()
+                    else:
+                        with torch.no_grad():
+                            next_hidden_state = self._net_mod.update_hidden_state(
+                                next_posterior,
+                                next_actions,
+                            )
+                    # Scatter the active rows back into the full batch without
+                    # an in-place write, preserving the graph through F_phi.
+                    candidate_hidden_state = hidden_state.index_copy(
+                        0,
+                        next_indices,
+                        next_hidden_state,
+                    )
+                    hidden_state = torch.where(
+                        next_valid_rows.unsqueeze(-1),
+                        candidate_hidden_state,
+                        hidden_state,
+                    )
 
         if accumulated_loss is None or accumulated_weight.item() <= 0:
-            raise RuntimeError("sequence batch contains no valid transitions")
+            raise RuntimeError("sequence batch contains no valid target transitions")
         total_loss = accumulated_loss / accumulated_weight.clamp_min(1.0)
         total_loss.backward()
         self._optimizer.step()
@@ -1086,6 +1180,9 @@ class RVTAgent:
         result = {
             "total_loss": total_loss.item(),
             "sequence_valid_steps": accumulated_weight.item(),
+            "sequence_burn_in_steps": (
+                valid_mask.sum() - loss_mask.sum()
+            ).item(),
             "lr": self._optimizer.param_groups[0]["lr"],
         }
         for key, value in weighted_log.items():
@@ -1579,8 +1676,6 @@ class RVTAgent:
                 "A_psi",
                 "F_phi",
                 "U_omega",
-                "hidden_state_to_feat",
-                "hidden_state_to_trans",
             }
             for name, module in self._net_mod.mvt1.named_children():
                 if name not in trainable_hidden_modules:
@@ -1588,5 +1683,3 @@ class RVTAgent:
             self._net_mod.mvt1.A_psi.train()
             self._net_mod.mvt1.F_phi.train()
             self._net_mod.mvt1.U_omega.train()
-            self._net_mod.mvt1.hidden_state_to_feat.train()
-            self._net_mod.mvt1.hidden_state_to_trans.train()

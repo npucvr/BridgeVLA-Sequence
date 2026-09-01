@@ -55,6 +55,7 @@ def train(
     epoch,
     rank=0,
     sequence_training=False,
+    sequence_bptt_length=1,
 ):
     agent.train()
     log = defaultdict(list)
@@ -80,6 +81,8 @@ def train(
             "backprop": True,
             "reset_log": (iteration == 0),
         }
+        if sequence_training:
+            update_args["bptt_length"] = sequence_bptt_length
         has_sequence_batch = "valid_mask" in batch
         if has_sequence_batch != sequence_training:
             raise RuntimeError(
@@ -177,9 +180,19 @@ def load_initial_checkpoint(backbone, checkpoint_path):
         "mvt1.A_psi.",
         "mvt1.F_phi.",
         "mvt1.U_omega.",
+    )
+    legacy_direct_adapter_prefixes = (
         "mvt1.hidden_state_to_feat.",
         "mvt1.hidden_state_to_trans.",
     )
+    # Older H-token checkpoints contained direct action-head adapters.  The
+    # token-only route deliberately ignores those legacy keys, because the
+    # hidden state must reach BridgeVLA only through A_psi-corrected tokens.
+    state = {
+        key: value
+        for key, value in state.items()
+        if not key.startswith(legacy_direct_adapter_prefixes)
+    }
     if not backbone.mvt1.hidden_state_enabled:
         # A route checkpoint can still initialize the released policy when the
         # optional route is disabled; its extra keys are intentionally ignored.
@@ -195,8 +208,6 @@ def load_initial_checkpoint(backbone, checkpoint_path):
             "mvt1.A_psi.",
             "mvt1.F_phi.",
             "mvt1.U_omega.",
-            "mvt1.hidden_state_to_feat.",
-            "mvt1.hidden_state_to_trans.",
         )
         if backbone.mvt1.hidden_state_enabled
         else ()
@@ -229,8 +240,6 @@ def freeze_for_hidden_state_route(backbone):
         backbone.mvt1.A_psi,
         backbone.mvt1.F_phi,
         backbone.mvt1.U_omega,
-        backbone.mvt1.hidden_state_to_feat,
-        backbone.mvt1.hidden_state_to_trans,
     ]
     for module in trainable_modules:
         for parameter in module.parameters():
@@ -325,6 +334,33 @@ def experiment(cmd_args):
         if cmd_args.hidden_state_sequence_length is not None
         else exp_cfg.hidden_state_sequence_length
     )
+    bptt_length = int(
+        cmd_args.hidden_state_sequence_bptt_length
+        if cmd_args.hidden_state_sequence_bptt_length is not None
+        else exp_cfg.hidden_state_sequence_bptt_length
+    )
+    full_episode = bool(
+        exp_cfg.hidden_state_sequence_full_episode
+        or cmd_args.hidden_state_sequence_full_episode
+    )
+    burn_in_length = int(
+        cmd_args.hidden_state_sequence_burn_in
+        if cmd_args.hidden_state_sequence_burn_in is not None
+        else exp_cfg.hidden_state_sequence_burn_in
+    )
+    if bptt_length < 1:
+        raise ValueError(
+            "hidden_state_sequence_bptt_length must be at least 1"
+        )
+    if burn_in_length < 0:
+        raise ValueError(
+            "hidden_state_sequence_burn_in must be non-negative"
+        )
+    if full_episode and burn_in_length:
+        raise ValueError(
+            "full-episode sequence training starts at the episode boundary; "
+            "hidden_state_sequence_burn_in must be zero"
+        )
     if sequence_training and sequence_length < 2:
         raise ValueError(
             "hidden_state_sequence_length must be at least 2 when "
@@ -359,6 +395,8 @@ def experiment(cmd_args):
         clip_cache_dir=cmd_args.clip_cache_dir,
         sequence_training=sequence_training,
         sequence_length=sequence_length,
+        burn_in_length=burn_in_length,
+        full_episode=full_episode,
     )
     train_dataset, _ = get_dataset_func()
     t_end = time.time()
@@ -494,6 +532,7 @@ def experiment(cmd_args):
             epoch=i,
             rank=dist.get_rank(),
             sequence_training=sequence_training,
+            sequence_bptt_length=bptt_length,
         )
 
         if dist.get_rank()==0 and (i %10==0 or i == end_epoch-1):
@@ -547,7 +586,24 @@ if __name__ == "__main__":
         "--hidden_state_sequence_length",
         type=int,
         default=None,
-        help="Number of chronological transitions in each hidden-state window.",
+        help="Legacy fixed-window length when full-episode mode is disabled.",
+    )
+    parser.add_argument(
+        "--hidden_state_sequence_bptt_length",
+        type=int,
+        default=None,
+        help="Maximum action-loss gradient span inside each episode.",
+    )
+    parser.add_argument(
+        "--hidden_state_sequence_full_episode",
+        action="store_true",
+        help="Process complete replay episodes in chronological order.",
+    )
+    parser.add_argument(
+        "--hidden_state_sequence_burn_in",
+        type=int,
+        default=None,
+        help="Legacy fixed-window burn-in; must be zero in full-episode mode.",
     )
     cmd_args = parser.parse_args()
     experiment(cmd_args)

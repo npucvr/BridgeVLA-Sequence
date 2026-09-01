@@ -50,13 +50,26 @@ def get_dataset(
     clip_cache_dir=None,
     sequence_training=False,
     sequence_length=1,
+    burn_in_length=0,
+    full_episode=False,
 ):
 
     sequence_training = bool(sequence_training)
     sequence_length = int(sequence_length)
+    burn_in_length = int(burn_in_length)
+    full_episode = bool(full_episode)
+    if burn_in_length < 0:
+        raise ValueError(
+            f"burn_in_length must be non-negative, got {burn_in_length}"
+        )
     if sequence_training and sequence_length < 2:
         raise ValueError(
             "sequence_length must be at least 2 when sequence_training is enabled"
+        )
+    if full_episode and burn_in_length:
+        raise ValueError(
+            "full_episode training starts at the episode boundary; "
+            "burn_in_length must be zero"
         )
 
     train_replay_buffer = create_replay(
@@ -165,12 +178,14 @@ def get_dataset(
         torch.cuda.empty_cache()
 
     # The legacy replay remains a one-step buffer.  Sequence training uses an
-    # opt-in forward sampler so existing replay files and the default random
-    # transition path remain unchanged.
+    # opt-in chronological sampler so existing replay files and the default
+    # random transition path remain unchanged.
     if sequence_training:
         train_replay_source = SequenceReplayBuffer(
             train_replay_buffer,
             sequence_length=sequence_length,
+            burn_in_length=burn_in_length,
+            full_episode=full_episode,
         )
     else:
         train_replay_source = train_replay_buffer
