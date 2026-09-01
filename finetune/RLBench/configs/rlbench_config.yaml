@@ -7,7 +7,14 @@ train_iter: 160000
 sample_distribution_mode: task_uniform
 # Enable these for the chronological H-token hidden-state route.
 hidden_state_sequence_training: false
+# Legacy fixed-window length; full-episode mode uses episode length instead.
 hidden_state_sequence_length: 4
+# Process each complete episode from its first transition.
+hidden_state_sequence_full_episode: true
+# One-step truncated BPTT: state values carry forward, gradients do not.
+hidden_state_sequence_bptt_length: 1
+# Only used by the legacy fixed-window sampler.
+hidden_state_sequence_burn_in: 0
 peract:
   lr: 8e-5 # 
   transform_augmentation_xyz: [0.125, 0.125, 0.125]

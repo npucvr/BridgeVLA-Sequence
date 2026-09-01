@@ -284,6 +284,37 @@ class UniformReplayBuffer(ReplayBuffer):
             for element in self._storage_signature
         }
 
+    def sequence_transition_markers(self, task_idx, local_idx):
+        """Read terminal/timeout without loading a disk transition payload."""
+        task_idx, local_idx = int(task_idx), int(local_idx)
+        global_index = None
+        if self._disk_saving:
+            candidate = int(self._task_replay_start_index[task_idx]) + local_idx
+            if (
+                0 <= candidate < self._replay_capacity
+                and tuple(self._index_mapping[candidate]) == (task_idx, local_idx)
+            ):
+                global_index = candidate
+        if global_index is None:
+            global_index = self.sequence_global_index(task_idx, local_idx)
+        if global_index is None:
+            raise RuntimeError(
+                "Replay does not contain task/local mapping for "
+                f"({task_idx}, {local_idx})"
+            )
+        timeout_store = self._store.get(TIMEOUT)
+        # Legacy disk replay files only persist terminal in replay_info.npy;
+        # the RLBench writer currently stores timeout=False for every record.
+        timeout_value = (
+            False
+            if timeout_store is None
+            else bool(np.asarray(timeout_store[global_index]).item())
+        )
+        return (
+            int(np.asarray(self._store[TERMINAL][global_index]).item()),
+            timeout_value,
+        )
+
     def _create_storage(self, store=None):
         """Creates the numpy arrays used to store transitions.
         """

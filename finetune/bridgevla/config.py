@@ -11,12 +11,20 @@ _C.bs = 4
 _C.epochs = 100
 # number of dataloader workers, >= 0
 _C.num_workers = 0
-# 'transition_uniform' or 'task_uniform'
+# 'transition_uniform', 'task_uniform', 'episode_uniform', or
+# 'episode_length_weighted' (the last two apply to full-episode sampling).
 _C.sample_distribution_mode = 'transition_uniform'
 # Opt-in chronological training for the hidden-state route.  The legacy
 # transition sampler remains the default for checkpoint compatibility.
 _C.hidden_state_sequence_training = False
+# ``hidden_state_sequence_length`` remains the legacy fixed-window length.
 _C.hidden_state_sequence_length = 4
+# Sequence training now samples complete episodes by default and truncates
+# action-loss gradients after each transition while carrying state values.
+_C.hidden_state_sequence_full_episode = True
+_C.hidden_state_sequence_bptt_length = 1
+# Kept for the legacy fixed-window sampler; full-episode mode requires zero.
+_C.hidden_state_sequence_burn_in = 0
 _C.train_iter = 16 * 10000
 _C.use_scheduler = True
 # arguments present in both peract and rvt
