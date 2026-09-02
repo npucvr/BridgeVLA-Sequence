@@ -180,6 +180,7 @@ def load_initial_checkpoint(backbone, checkpoint_path):
         "mvt1.A_psi.",
         "mvt1.F_phi.",
         "mvt1.U_omega.",
+        "mvt1.observation_decoder.",
     )
     legacy_direct_adapter_prefixes = (
         "mvt1.hidden_state_to_feat.",
@@ -201,6 +202,16 @@ def load_initial_checkpoint(backbone, checkpoint_path):
             for key, value in state.items()
             if not key.startswith(hidden_route_prefixes)
         }
+    elif not getattr(
+        backbone.mvt1, "hidden_state_observation_prediction", False
+    ):
+        # An observation-prediction checkpoint can initialize the original
+        # hidden-state route when the auxiliary decoder is disabled.
+        state = {
+            key: value
+            for key, value in state.items()
+            if not key.startswith("mvt1.observation_decoder.")
+        }
     missing, unexpected = backbone.load_state_dict(state, strict=False)
     unexpected = list(unexpected)
     allowed_missing_prefixes = (
@@ -208,6 +219,13 @@ def load_initial_checkpoint(backbone, checkpoint_path):
             "mvt1.A_psi.",
             "mvt1.F_phi.",
             "mvt1.U_omega.",
+        )
+        + (
+            ("mvt1.observation_decoder.",)
+            if getattr(
+                backbone.mvt1, "hidden_state_observation_prediction", False
+            )
+            else ()
         )
         if backbone.mvt1.hidden_state_enabled
         else ()
@@ -241,6 +259,10 @@ def freeze_for_hidden_state_route(backbone):
         backbone.mvt1.F_phi,
         backbone.mvt1.U_omega,
     ]
+    if getattr(
+        backbone.mvt1, "hidden_state_observation_prediction", False
+    ):
+        trainable_modules.append(backbone.mvt1.observation_decoder)
     for module in trainable_modules:
         for parameter in module.parameters():
             parameter.requires_grad = True
@@ -417,6 +439,22 @@ def experiment(cmd_args):
     if sequence_training and not mvt_cfg.hidden_state_enabled:
         raise ValueError(
             "hidden-state sequence training requires hidden_state_enabled=True"
+        )
+    observation_loss_weight = float(
+        exp_cfg.rvt.hidden_state_observation_loss_weight
+    )
+    if observation_loss_weight > 0.0 and not sequence_training:
+        raise ValueError(
+            "hidden_state_observation_loss_weight requires chronological "
+            "hidden-state sequence training"
+        )
+    if (
+        observation_loss_weight > 0.0
+        and not mvt_cfg.hidden_state_observation_prediction
+    ):
+        raise ValueError(
+            "hidden_state_observation_loss_weight requires "
+            "mvt.hidden_state_observation_prediction=True"
         )
     mvt_cfg.freeze()
 

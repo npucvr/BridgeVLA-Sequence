@@ -47,6 +47,9 @@ _C.rvt.gt_hm_sigma = 1.5
 _C.rvt.img_aug = 0.1
 _C.rvt.place_with_mean = True
 _C.rvt.move_pc_in_bound = True
+# Weight for the causal y_t^- -> current visual-observation auxiliary loss.
+# Keep zero to preserve the original hidden-state route by default.
+_C.rvt.hidden_state_observation_loss_weight = 0.0
 
 # arguments present in peract official
 _C.peract_official = CN()

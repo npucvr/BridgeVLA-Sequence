@@ -69,6 +69,8 @@ class MVT(nn.Module):
         hidden_state_token_bottleneck=128,
         hidden_state_update_heads=4,
         hidden_state_update_dropout=0.0,
+        hidden_state_observation_prediction=False,
+        hidden_state_observation_decoder_hidden_dim=256,
     ):
         super().__init__()
 
@@ -337,7 +339,8 @@ class MVT(nn.Module):
         :param language_goal: str (bs,)language instruction
         :param hidden_state_y: action-predicted prior state, when enabled
         :param hidden_state_update: apply U_omega on the first pass; stage-two
-            reuses that pass's posterior.
+            reuses that pass's posterior. The optional prior-observation target and
+            prediction are emitted only from the first pass.
         """
         self.verify_inp(
             pc=pc,

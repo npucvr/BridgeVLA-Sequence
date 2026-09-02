@@ -40,6 +40,10 @@ _C.hidden_state_action_dim = 8
 _C.hidden_state_token_bottleneck = 128
 _C.hidden_state_update_heads = 4
 _C.hidden_state_update_dropout = 0.0
+# Optional causal prior-observation prediction. The decoder sees only y_t^-;
+# the current visual-token feature is a detached training target.
+_C.hidden_state_observation_prediction = False
+_C.hidden_state_observation_decoder_hidden_dim = 256
 
 
 def get_cfg_defaults():

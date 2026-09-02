@@ -22,3 +22,5 @@ peract:
 rvt:
   place_with_mean: False
   img_aug: 0.0
+  # Set >0 together with mvt.hidden_state_observation_prediction: True.
+  hidden_state_observation_loss_weight: 0.0

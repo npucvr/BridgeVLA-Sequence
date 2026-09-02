@@ -416,6 +416,7 @@ class RVTAgent:
         rot_x_y_aug: int = 2,
         log_dir="",
         hidden_state_route_only=False,
+        hidden_state_observation_loss_weight: float = 0.0,
     ):
         self._network = network
         self._num_rotation_classes = num_rotation_classes
@@ -441,6 +442,19 @@ class RVTAgent:
         self.scene_bounds = scene_bounds
         self.cameras = cameras
         self._hidden_state_route_only = hidden_state_route_only
+        self._hidden_state_observation_loss_weight = float(
+            hidden_state_observation_loss_weight
+        )
+        if not np.isfinite(self._hidden_state_observation_loss_weight):
+            raise ValueError(
+                "hidden_state_observation_loss_weight must be finite, got "
+                f"{hidden_state_observation_loss_weight}"
+            )
+        if self._hidden_state_observation_loss_weight < 0.0:
+            raise ValueError(
+                "hidden_state_observation_loss_weight must be non-negative, "
+                f"got {hidden_state_observation_loss_weight}"
+            )
 
         print("Cameras:",self.cameras)
         self.move_pc_in_bound = move_pc_in_bound
@@ -456,9 +470,24 @@ class RVTAgent:
         self._hidden_state_enabled = bool(
             getattr(self._net_mod.mvt1, "hidden_state_enabled", False)
         )
+        self._hidden_state_observation_prediction = bool(
+            getattr(
+                self._net_mod.mvt1,
+                "hidden_state_observation_prediction",
+                False,
+            )
+        )
         if self._hidden_state_route_only and not self._hidden_state_enabled:
             raise ValueError(
                 "hidden_state_route_only requires hidden_state_enabled=True"
+            )
+        if (
+            self._hidden_state_observation_loss_weight > 0.0
+            and not self._hidden_state_observation_prediction
+        ):
+            raise ValueError(
+                "hidden_state_observation_loss_weight requires "
+                "hidden_state_observation_prediction=True"
             )
         self._hidden_state_y = None
         self._pending_action = None
@@ -818,6 +847,31 @@ class RVTAgent:
             rot_loss_x = rot_loss_y = rot_loss_z = zero_loss
             grip_loss = zero_loss
             collision_loss = zero_loss
+            # MVT emits this pair before U_omega: the decoder consumes y_t^-
+            # and the current visual target is detached from the encoder graph.
+            observation_loss = zero_loss
+            if self._hidden_state_observation_loss_weight > 0.0:
+                observation_prediction = out.get(
+                    "hidden_state_observation_prediction"
+                )
+                observation_target = out.get(
+                    "hidden_state_observation_target"
+                )
+                observation_nll = out.get("hidden_state_observation_nll")
+                observation_decoder = getattr(
+                    self._net_mod.mvt1, "observation_decoder", None
+                )
+                if (
+                    observation_prediction is None
+                    or observation_target is None
+                    or observation_nll is None
+                    or observation_decoder is None
+                ):
+                    raise RuntimeError(
+                        "observation prediction is enabled, but the network "
+                        "did not return a prior observation target/prediction/NLL"
+                    )
+                observation_loss = reduce_loss(observation_nll)
             if self.add_rgc_loss:
                 rot_loss_x = reduce_loss(
                     self._cross_entropy_loss(
@@ -862,13 +916,16 @@ class RVTAgent:
                     )
                 )
 
-            total_loss = (
+            action_loss = (
                 trans_loss
                 + rot_loss_x
                 + rot_loss_y
                 + rot_loss_z
                 + grip_loss
                 + collision_loss
+            )
+            total_loss = action_loss + (
+                self._hidden_state_observation_loss_weight * observation_loss
             )
 
 
@@ -885,6 +942,11 @@ class RVTAgent:
                 "rot_loss_z": rot_loss_z.item(),
                 "grip_loss": grip_loss.item(),
                 "collision_loss": collision_loss.item(),
+                "prior_observation_loss": observation_loss.item(),
+                "prior_observation_loss_weighted": (
+                    self._hidden_state_observation_loss_weight
+                    * observation_loss.item()
+                ),
                 "lr": self._optimizer.param_groups[0]["lr"],
             }
             if _manage_log:
@@ -982,7 +1044,9 @@ class RVTAgent:
         controls gradient truncation; with the default one-step setting the
         posterior is detached before ``F_phi`` while ``F_phi`` itself remains
         grad-enabled, so the next action loss trains the one-step transition
-        without backpropagating through older observations.
+        without backpropagating through older observations.  When enabled, the
+         prior-observation auxiliary loss uses the same valid target steps and
+         is included before sequence accumulation.
         """
         if not self._hidden_state_enabled:
             raise ValueError("update_sequence requires hidden_state_enabled=True")
@@ -1124,6 +1188,8 @@ class RVTAgent:
                         "rot_loss_z",
                         "grip_loss",
                         "collision_loss",
+                         "prior_observation_loss",
+                         "prior_observation_loss_weighted",
                     }:
                         weighted_log[key] = weighted_log.get(key, 0.0) + value * weight.item()
 
@@ -1677,6 +1743,8 @@ class RVTAgent:
                 "F_phi",
                 "U_omega",
             }
+            if self._hidden_state_observation_prediction:
+                trainable_hidden_modules.add("observation_decoder")
             for name, module in self._net_mod.mvt1.named_children():
                 if name not in trainable_hidden_modules:
                     module.eval()
