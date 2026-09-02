@@ -1,4 +1,6 @@
 #Adapted from https://github.com/NVlabs/RVT/blob/master/rvt/utils/peract_utils.py
+import os
+
 from omegaconf import OmegaConf
 
 from bridgevla.models.peract_official import create_agent_our
@@ -17,8 +19,14 @@ SCENE_BOUNDS = [
 IMAGE_SIZE = 128
 VOXEL_SIZES = [100]  # 100x100x100 voxels
 LOW_DIM_SIZE = 4  # {left_finger_joint, right_finger_joint, gripper_open, timestep}
-DATA_FOLDER="/mnt/hdfs/lpy/RLBench/peract_dataset/peract_18tasks/all_variations_128"
-TRAIN_REPLAY_STORAGE_DIR = "/mnt/hdfs/lpy/hugging_face/rvt2_replay_buffer/replay_train_new" # path to save buffer
+DATA_FOLDER = os.environ.get(
+    "BRIDGEVLA_RLBENCH_DATA_FOLDER",
+    "/mnt/hdfs/lpy/RLBench/peract_dataset/peract_18tasks/all_variations_128",
+)
+TRAIN_REPLAY_STORAGE_DIR = os.environ.get(
+    "BRIDGEVLA_RLBENCH_TRAIN_REPLAY_DIR",
+    "/mnt/hdfs/lpy/hugging_face/rvt2_replay_buffer/replay_train_new",
+)  # path to save buffer
 EPISODE_FOLDER = "episode%d"
 VARIATION_DESCRIPTIONS_PKL = "variation_descriptions.pkl"  # the pkl file that contains language goals for each demonstration
 DEMO_AUGMENTATION_EVERY_N = 10  # sample n-th frame in demo

@@ -14,6 +14,11 @@
 #   BRIDGEVLA_CHECK_GPU       require and print nvidia-smi (default: 1)
 #   BRIDGEVLA_EXPECTED_HOSTNAME  short hostname or comma-separated hostnames
 #   BRIDGEVLA_SKIP_CONDA      use an already activated/external Python env
+#
+# RLBench host-specific data overrides (consumed by peract_utils_rlbench.py):
+#   BRIDGEVLA_RLBENCH_DATA_FOLDER
+#   BRIDGEVLA_RLBENCH_TRAIN_REPLAY_DIR
+#   EVAL_DATAFOLDER             held-out RLBench EVAL data for evaluation launchers
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo "[bridgevla-runtime] source this file; do not execute it" >&2
