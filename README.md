@@ -85,11 +85,12 @@ bash train.sh --exp_cfg_path  configs/rlbench_config.yaml \
               --pretrain_path  PATH_TO_PRETRAINED_MODEL 
 ```
 
-如需运行新的 H-token hidden-state 路由，应从已训练的 BridgeVLA checkpoint 开始，并显式开启按时间顺序的 sequence trainer：
+如需运行新的 filter hidden-state 路由，应从已训练的 BridgeVLA checkpoint 开始，并显式开启按时间顺序的 sequence trainer：
 
 ```bash
 cd finetune/RLBench
-bash train.sh --mvt_cfg_opts "hidden_state_enabled True" \
+bash train.sh \
+              --mvt_cfg_opts "hidden_state_enabled True hidden_state_filter_correction True" \
               --hidden_state_route_only \
               --init_checkpoint PATH_TO_BRIDGEVLA_CHECKPOINT \
               --hidden_state_sequence_training \
@@ -100,7 +101,28 @@ bash train.sh --mvt_cfg_opts "hidden_state_enabled True" \
 
 该模式继续读取旧的 one-step replay 文件；sequence sampler 会沿 action forward 读取同一 replay task，并用 terminal/timeout/`valid_mask` 阻止跨 episode 展开。`hidden_state_enabled=False` 时仍使用原始 independent-transition 路径。
 
+RLBench 训练入口支持 PyTorch DDP。单机多卡时，`GPUS_PER_NODE` 必须与可见 GPU 数量一致；`bs` 是每张 GPU 的 batch size，`train_iter` 按全局有效 batch 计算。例如，要保持单卡 `bs=4` 的实验协议，可以使用两张 GPU、每卡 `bs=2`：
+
+```bash
+cd finetune/RLBench
+CUDA_VISIBLE_DEVICES=0,1 GPUS_PER_NODE=2 bash train.sh \
+  --exp_cfg_path configs/rlbench_config.yaml \
+  --exp_cfg_opts "bs 2 train_iter 8000" \
+  --exp_note ddp2 \
+  --log_dir PATH_TO_LOG_DIR
+```
+
+训练 replay 在各个 DDP rank 上独立随机采样；启动时会为 rank/worker 设置不同的随机流，不承诺严格无重叠样本。首次使用多卡时应先运行少量 `train_iter` smoke test，再开始正式实验。
+
 实验运行产物（checkpoint、日志、评测 CSV、可视化和缓存）建议写入项目根目录的 `outputs/`；该目录已加入 `.gitignore`，不会被 Git 追踪。`data/` 仅保留数据集、replay buffer 和用户提供的模型权重等输入资产。
+
+多机运行时使用 host-local 配置，不把机器私有路径写入仓库。`scripts/bridgevla_runtime.sh` 会自动加载：
+
+```text
+~/.config/bridgevla/$(hostname -s).env
+```
+
+该文件集中保存本机的 conda、CUDA、CoppeliaSim、RLBench train/eval/replay 和模型权重路径，例如 `BRIDGEVLA_RLBENCH_DATA_FOLDER`、`BRIDGEVLA_RLBENCH_TRAIN_REPLAY_DIR`、`EVAL_DATAFOLDER`、`BRIDGEVLA_INIT_CHECKPOINT` 和 `BRIDGEVLA_PALIGEMMA_PATH`。代码和模型权重从 NFS 仓库加载；训练和评估实际读取的 train/eval/replay 数据应指向对应机器的本地高速盘。
 
 3. **COLOSSEUM Fine-tuning:** For COLOSSEUM, we fine-tune the model with the training dataset provided by the [COLOSSEUM challenge](https://huggingface.co/datasets/colosseum/colosseum-challenge/tree/main). Similarly, our training code will first convert the raw data into replay buffer. You can also directly download the replay buffer we preprocess [here](https://huggingface.co/datasets/LPY/BridgeVLA_COLOSSEUM_TRAIN_BUFFER/tree/main). Then, you can use the `finetune/Colosseum/train.sh` file to finetune the model. Please run the following code:
 ```bash
@@ -270,5 +292,3 @@ If you have any questions about the code, please contact peiyan.li@cripac.ia.ac.
     primaryClass={cs.RO}
 }
 ```
-
-
