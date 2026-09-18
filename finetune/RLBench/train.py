@@ -176,19 +176,22 @@ def load_initial_checkpoint(backbone, checkpoint_path):
         checkpoint_path, map_location="cpu", weights_only=True
     )
     state = checkpoint.get("model_state", checkpoint)
-    hidden_route_prefixes = (
+    legacy_hidden_route_prefixes = (
         "mvt1.A_psi.",
-        "mvt1.F_phi.",
         "mvt1.U_omega.",
         "mvt1.observation_decoder.",
     )
+    hidden_route_prefixes = (
+        "mvt1.F_phi.",
+        "mvt1.filter_correction.",
+    ) + legacy_hidden_route_prefixes
     legacy_direct_adapter_prefixes = (
         "mvt1.hidden_state_to_feat.",
         "mvt1.hidden_state_to_trans.",
     )
-    # Older H-token checkpoints contained direct action-head adapters.  The
-    # token-only route deliberately ignores those legacy keys, because the
-    # hidden state must reach BridgeVLA only through A_psi-corrected tokens.
+    # Older hidden-state checkpoints contained direct action-head adapters and
+    # the removed prior-observation route. Ignore those legacy keys when
+    # initializing the current model.
     state = {
         key: value
         for key, value in state.items()
@@ -202,34 +205,21 @@ def load_initial_checkpoint(backbone, checkpoint_path):
             for key, value in state.items()
             if not key.startswith(hidden_route_prefixes)
         }
-    elif not getattr(
-        backbone.mvt1, "hidden_state_observation_prediction", False
-    ):
-        # An observation-prediction checkpoint can initialize the original
-        # hidden-state route when the auxiliary decoder is disabled.
+    else:
         state = {
             key: value
             for key, value in state.items()
-            if not key.startswith("mvt1.observation_decoder.")
+            if not key.startswith(legacy_hidden_route_prefixes)
         }
     missing, unexpected = backbone.load_state_dict(state, strict=False)
     unexpected = list(unexpected)
-    allowed_missing_prefixes = (
-        (
-            "mvt1.A_psi.",
+    if not backbone.mvt1.hidden_state_enabled:
+        allowed_missing_prefixes = ()
+    else:
+        allowed_missing_prefixes = (
             "mvt1.F_phi.",
-            "mvt1.U_omega.",
+            "mvt1.filter_correction.",
         )
-        + (
-            ("mvt1.observation_decoder.",)
-            if getattr(
-                backbone.mvt1, "hidden_state_observation_prediction", False
-            )
-            else ()
-        )
-        if backbone.mvt1.hidden_state_enabled
-        else ()
-    )
     missing = [
         key
         for key in missing
@@ -255,14 +245,9 @@ def freeze_for_hidden_state_route(backbone):
     for parameter in backbone.parameters():
         parameter.requires_grad = False
     trainable_modules = [
-        backbone.mvt1.A_psi,
         backbone.mvt1.F_phi,
-        backbone.mvt1.U_omega,
+        backbone.mvt1.filter_correction,
     ]
-    if getattr(
-        backbone.mvt1, "hidden_state_observation_prediction", False
-    ):
-        trainable_modules.append(backbone.mvt1.observation_decoder)
     for module in trainable_modules:
         for parameter in module.parameters():
             parameter.requires_grad = True
@@ -440,22 +425,20 @@ def experiment(cmd_args):
         raise ValueError(
             "hidden-state sequence training requires hidden_state_enabled=True"
         )
-    observation_loss_weight = float(
-        exp_cfg.rvt.hidden_state_observation_loss_weight
+    filter_innovation_loss_weight = float(
+        exp_cfg.rvt.hidden_state_filter_innovation_loss_weight
     )
-    if observation_loss_weight > 0.0 and not sequence_training:
-        raise ValueError(
-            "hidden_state_observation_loss_weight requires chronological "
-            "hidden-state sequence training"
-        )
-    if (
-        observation_loss_weight > 0.0
-        and not mvt_cfg.hidden_state_observation_prediction
-    ):
-        raise ValueError(
-            "hidden_state_observation_loss_weight requires "
-            "mvt.hidden_state_observation_prediction=True"
-        )
+    if filter_innovation_loss_weight > 0.0:
+        if not mvt_cfg.hidden_state_filter_correction:
+            raise ValueError(
+                "hidden_state_filter_innovation_loss_weight requires "
+                "mvt.hidden_state_filter_correction=True"
+            )
+        if not sequence_training:
+            raise ValueError(
+                "hidden_state_filter_innovation_loss_weight requires "
+                "chronological hidden-state sequence training"
+            )
     mvt_cfg.freeze()
 
     # for maintaining backward compatibility

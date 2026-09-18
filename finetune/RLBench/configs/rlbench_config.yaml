@@ -5,7 +5,7 @@ num_workers: 3
 epochs: 100
 train_iter: 160000
 sample_distribution_mode: task_uniform
-# Enable these for the chronological H-token hidden-state route.
+# Enable these for the chronological filter hidden-state route.
 hidden_state_sequence_training: false
 # Legacy fixed-window length; full-episode mode uses episode length instead.
 hidden_state_sequence_length: 4
@@ -22,5 +22,3 @@ peract:
 rvt:
   place_with_mean: False
   img_aug: 0.0
-  # Set >0 together with mvt.hidden_state_observation_prediction: True.
-  hidden_state_observation_loss_weight: 0.0

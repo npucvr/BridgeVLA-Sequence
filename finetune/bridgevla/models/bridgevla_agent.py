@@ -416,7 +416,7 @@ class RVTAgent:
         rot_x_y_aug: int = 2,
         log_dir="",
         hidden_state_route_only=False,
-        hidden_state_observation_loss_weight: float = 0.0,
+        hidden_state_filter_innovation_loss_weight: float = 0.0,
     ):
         self._network = network
         self._num_rotation_classes = num_rotation_classes
@@ -442,18 +442,19 @@ class RVTAgent:
         self.scene_bounds = scene_bounds
         self.cameras = cameras
         self._hidden_state_route_only = hidden_state_route_only
-        self._hidden_state_observation_loss_weight = float(
-            hidden_state_observation_loss_weight
+        self._hidden_state_filter_innovation_loss_weight = float(
+            hidden_state_filter_innovation_loss_weight
         )
-        if not np.isfinite(self._hidden_state_observation_loss_weight):
+        if not np.isfinite(self._hidden_state_filter_innovation_loss_weight):
             raise ValueError(
-                "hidden_state_observation_loss_weight must be finite, got "
-                f"{hidden_state_observation_loss_weight}"
+                "hidden_state_filter_innovation_loss_weight must be finite, "
+                f"got {hidden_state_filter_innovation_loss_weight}"
             )
-        if self._hidden_state_observation_loss_weight < 0.0:
+        if self._hidden_state_filter_innovation_loss_weight < 0.0:
             raise ValueError(
-                "hidden_state_observation_loss_weight must be non-negative, "
-                f"got {hidden_state_observation_loss_weight}"
+                "hidden_state_filter_innovation_loss_weight must be "
+                "non-negative, got "
+                f"{hidden_state_filter_innovation_loss_weight}"
             )
 
         print("Cameras:",self.cameras)
@@ -470,10 +471,10 @@ class RVTAgent:
         self._hidden_state_enabled = bool(
             getattr(self._net_mod.mvt1, "hidden_state_enabled", False)
         )
-        self._hidden_state_observation_prediction = bool(
+        self._hidden_state_filter_correction = bool(
             getattr(
                 self._net_mod.mvt1,
-                "hidden_state_observation_prediction",
+                "hidden_state_filter_correction",
                 False,
             )
         )
@@ -482,12 +483,12 @@ class RVTAgent:
                 "hidden_state_route_only requires hidden_state_enabled=True"
             )
         if (
-            self._hidden_state_observation_loss_weight > 0.0
-            and not self._hidden_state_observation_prediction
+            self._hidden_state_filter_innovation_loss_weight > 0.0
+            and not self._hidden_state_filter_correction
         ):
             raise ValueError(
-                "hidden_state_observation_loss_weight requires "
-                "hidden_state_observation_prediction=True"
+                "hidden_state_filter_innovation_loss_weight requires "
+                "hidden_state_filter_correction=True"
             )
         self._hidden_state_y = None
         self._pending_action = None
@@ -847,31 +848,19 @@ class RVTAgent:
             rot_loss_x = rot_loss_y = rot_loss_z = zero_loss
             grip_loss = zero_loss
             collision_loss = zero_loss
-            # MVT emits this pair before U_omega: the decoder consumes y_t^-
-            # and the current visual target is detached from the encoder graph.
-            observation_loss = zero_loss
-            if self._hidden_state_observation_loss_weight > 0.0:
-                observation_prediction = out.get(
-                    "hidden_state_observation_prediction"
-                )
-                observation_target = out.get(
-                    "hidden_state_observation_target"
-                )
-                observation_nll = out.get("hidden_state_observation_nll")
-                observation_decoder = getattr(
-                    self._net_mod.mvt1, "observation_decoder", None
-                )
-                if (
-                    observation_prediction is None
-                    or observation_target is None
-                    or observation_nll is None
-                    or observation_decoder is None
-                ):
+            # Filter route: the auxiliary objective is the innovation negative
+            # log likelihood of the Kalman filter, which trains the learned
+            # measurement/process/measurement-noise models rather than an
+            # arbitrary visual reconstruction target.
+            filter_innovation_loss = zero_loss
+            if self._hidden_state_filter_innovation_loss_weight > 0.0:
+                innovation_nll = out.get("hidden_state_filter_innovation_nll")
+                if innovation_nll is None:
                     raise RuntimeError(
-                        "observation prediction is enabled, but the network "
-                        "did not return a prior observation target/prediction/NLL"
+                        "filter innovation loss is enabled, but the network did "
+                        "not return hidden_state_filter_innovation_nll"
                     )
-                observation_loss = reduce_loss(observation_nll)
+                filter_innovation_loss = reduce_loss(innovation_nll)
             if self.add_rgc_loss:
                 rot_loss_x = reduce_loss(
                     self._cross_entropy_loss(
@@ -925,7 +914,8 @@ class RVTAgent:
                 + collision_loss
             )
             total_loss = action_loss + (
-                self._hidden_state_observation_loss_weight * observation_loss
+                self._hidden_state_filter_innovation_loss_weight
+                * filter_innovation_loss
             )
 
 
@@ -942,13 +932,29 @@ class RVTAgent:
                 "rot_loss_z": rot_loss_z.item(),
                 "grip_loss": grip_loss.item(),
                 "collision_loss": collision_loss.item(),
-                "prior_observation_loss": observation_loss.item(),
-                "prior_observation_loss_weighted": (
-                    self._hidden_state_observation_loss_weight
-                    * observation_loss.item()
+                "filter_innovation_loss": filter_innovation_loss.item(),
+                "filter_innovation_loss_weighted": (
+                    self._hidden_state_filter_innovation_loss_weight
+                    * filter_innovation_loss.item()
                 ),
                 "lr": self._optimizer.param_groups[0]["lr"],
             }
+            # Design document §10.3 monitoring: a vanishing residual, a
+            # collapsing posterior trace, or a runaway measurement noise each
+            # mean the filter has silently stopped doing useful work.
+            for _name in (
+                "residual_ratio",
+                "posterior_trace",
+                "measure_noise_trace",
+                "process_noise_trace",
+                "mean_correction_norm",
+                "alpha",
+            ):
+                _value = out.get(f"hidden_state_filter_{_name}")
+                if _value is not None:
+                    loss_log[f"filter_{_name}"] = float(
+                        _value.detach().reshape(-1)[0]
+                    )
             if _manage_log:
                 manage_loss_log(self, loss_log, reset_log=reset_log)
             return_out.update(loss_log)
@@ -1044,9 +1050,9 @@ class RVTAgent:
         controls gradient truncation; with the default one-step setting the
         posterior is detached before ``F_phi`` while ``F_phi`` itself remains
         grad-enabled, so the next action loss trains the one-step transition
-        without backpropagating through older observations.  When enabled, the
-         prior-observation auxiliary loss uses the same valid target steps and
-         is included before sequence accumulation.
+        without backpropagating through older observations.  The optional
+        filter innovation loss uses the same valid target steps and is included
+        before sequence accumulation.
         """
         if not self._hidden_state_enabled:
             raise ValueError("update_sequence requires hidden_state_enabled=True")
@@ -1164,7 +1170,7 @@ class RVTAgent:
             posterior = step_output.get("_hidden_state_y")
             if posterior is None:
                 raise RuntimeError(
-                    "hidden-state sequence update did not return U_omega posterior"
+                    "hidden-state sequence update did not return filter posterior"
                 )
             if has_loss:
                 if step_loss is None:
@@ -1188,8 +1194,14 @@ class RVTAgent:
                         "rot_loss_z",
                         "grip_loss",
                         "collision_loss",
-                         "prior_observation_loss",
-                         "prior_observation_loss_weighted",
+                         "filter_innovation_loss",
+                         "filter_innovation_loss_weighted",
+                         "filter_residual_ratio",
+                         "filter_posterior_trace",
+                         "filter_measure_noise_trace",
+                         "filter_process_noise_trace",
+                         "filter_mean_correction_norm",
+                         "filter_alpha",
                     }:
                         weighted_log[key] = weighted_log.get(key, 0.0) + value * weight.item()
 
@@ -1202,10 +1214,10 @@ class RVTAgent:
                     next_actions = action_sequence[next_indices, timestep]
                     if has_loss:
                         if bptt_length == 1:
-                            # Keep the numerical state continuous, but cut the
-                            # older U_omega graph before the one-step transition.
+                            # Keep the numerical belief continuous, but cut the
+                            # older filter graph before the one-step transition.
                             # F_phi must remain grad-enabled: the next action
-                            # loss is its only supervision on this route.
+                            # loss is its only supervision on this transition.
                             transition_input = next_posterior.detach()
                             next_hidden_state = self._net_mod.update_hidden_state(
                                 transition_input,
@@ -1551,7 +1563,7 @@ class RVTAgent:
             posterior_hidden_state = out.get("hidden_state_y")
             if posterior_hidden_state is None:
                 raise RuntimeError(
-                    "hidden-state network did not return the U_omega posterior"
+                    "hidden-state network did not return the filter posterior"
                 )
             self._hidden_state_y = posterior_hidden_state.detach()
         if visualize:
@@ -1738,16 +1750,12 @@ class RVTAgent:
     def train(self):
         self._network.train()
         if self._hidden_state_route_only:
-            trainable_hidden_modules = {
-                "A_psi",
-                "F_phi",
-                "U_omega",
-            }
-            if self._hidden_state_observation_prediction:
-                trainable_hidden_modules.add("observation_decoder")
+            # Only the route's own modules stay in training mode; the frozen
+            # BridgeVLA stack is kept in eval so its BatchNorm statistics do not
+            # drift between timesteps.
+            trainable_hidden_modules = {"F_phi", "filter_correction"}
             for name, module in self._net_mod.mvt1.named_children():
                 if name not in trainable_hidden_modules:
                     module.eval()
-            self._net_mod.mvt1.A_psi.train()
-            self._net_mod.mvt1.F_phi.train()
-            self._net_mod.mvt1.U_omega.train()
+            for name in trainable_hidden_modules:
+                getattr(self._net_mod.mvt1, name).train()

@@ -27,11 +27,8 @@ from bridgevla.mvt.attn import (
 )
 from bridgevla.mvt.raft_utils import ConvexUpSample
 from bridgevla.hidden_state import (
-    A_psi,
+    FilterCorrection,
     F_phi,
-    ObservationDecoder,
-    U_omega,
-    pool_visual_tokens,
 )
 from PIL import Image
 
@@ -74,11 +71,12 @@ class MVT(nn.Module):
         hidden_state_enabled=False,
         hidden_state_dim=128,
         hidden_state_action_dim=8,
-        hidden_state_token_bottleneck=128,
-        hidden_state_update_heads=4,
-        hidden_state_update_dropout=0.0,
-        hidden_state_observation_prediction=False,
-        hidden_state_observation_decoder_hidden_dim=256,
+        hidden_state_filter_correction=False,
+        hidden_state_filter_measure_dim=64,
+        hidden_state_filter_grid=4,
+        hidden_state_filter_full_covariance=True,
+        hidden_state_filter_seed=0,
+        hidden_state_filter_init_log_measure_noise=48.0,
     ):
         super().__init__()
         self.depth = depth
@@ -145,65 +143,72 @@ class MVT(nn.Module):
         self.hidden_state_enabled = bool(hidden_state_enabled)
         self.hidden_state_dim = int(hidden_state_dim)
         self.hidden_state_action_dim = int(hidden_state_action_dim)
-        self.hidden_state_token_bottleneck = int(hidden_state_token_bottleneck)
-        self.hidden_state_update_heads = int(hidden_state_update_heads)
-        self.hidden_state_update_dropout = float(hidden_state_update_dropout)
-        self.hidden_state_observation_prediction = bool(
-            hidden_state_observation_prediction
+        self.hidden_state_filter_correction = bool(hidden_state_filter_correction)
+        self.hidden_state_filter_measure_dim = int(hidden_state_filter_measure_dim)
+        self.hidden_state_filter_grid = int(hidden_state_filter_grid)
+        self.hidden_state_filter_full_covariance = bool(
+            hidden_state_filter_full_covariance
         )
-        self.hidden_state_observation_decoder_hidden_dim = int(
-            hidden_state_observation_decoder_hidden_dim
+        self.hidden_state_filter_seed = int(hidden_state_filter_seed)
+        self.hidden_state_filter_init_log_measure_noise = float(
+            hidden_state_filter_init_log_measure_noise
         )
         if self.hidden_state_dim < 1:
             raise ValueError("hidden_state_dim must be >= 1")
         if self.hidden_state_action_dim < 1:
             raise ValueError("hidden_state_action_dim must be >= 1")
-        if self.hidden_state_token_bottleneck < 1:
-            raise ValueError("hidden_state_token_bottleneck must be >= 1")
-        if (
-            self.hidden_state_observation_prediction
-            and not self.hidden_state_enabled
-        ):
+        if self.hidden_state_enabled and not self.hidden_state_filter_correction:
             raise ValueError(
-                "hidden_state_observation_prediction requires "
-                "hidden_state_enabled=True"
+                "the hidden-state route requires "
+                "hidden_state_filter_correction=True"
             )
-        if self.hidden_state_observation_decoder_hidden_dim < 1:
-            raise ValueError(
-                "hidden_state_observation_decoder_hidden_dim must be >= 1"
-            )
+        if self.hidden_state_filter_correction:
+            if not self.hidden_state_enabled:
+                raise ValueError(
+                    "hidden_state_filter_correction requires "
+                    "hidden_state_enabled=True"
+                )
+            if self.hidden_state_filter_measure_dim < 1:
+                raise ValueError(
+                    "hidden_state_filter_measure_dim must be >= 1"
+                )
+            if self.hidden_state_filter_init_log_measure_noise <= 0.0:
+                raise ValueError(
+                    "hidden_state_filter_init_log_measure_noise must be > 0"
+                )
+            if self.hidden_state_filter_grid < 1:
+                raise ValueError("hidden_state_filter_grid must be >= 1")
+            if self.num_pat_img % self.hidden_state_filter_grid != 0:
+                raise ValueError(
+                    "hidden_state_filter_grid must divide the per-view patch "
+                    f"grid: grid={self.hidden_state_filter_grid}, "
+                    f"patch_grid={self.num_pat_img}"
+                )
 
         # Do not register new modules when the route is disabled. This keeps
         # the original BridgeVLA checkpoint keys and default forward path
         # unchanged.
         if self.hidden_state_enabled:
-            # The H-token route interacts with BridgeVLA only through the
-            # corrected visual tokens.  The recurrent state is updated by
-            # U_omega/F_phi, then A_psi injects it into the token sequence;
-            # action features and translation heatmaps remain untouched.
-            self.U_omega = U_omega(
-                token_dim=self.vlm_dim,
-                hidden_state_dim=self.hidden_state_dim,
-                num_heads=self.hidden_state_update_heads,
-                dropout=self.hidden_state_update_dropout,
-            )
-            self.A_psi = A_psi(
-                token_dim=self.vlm_dim,
-                token_bottleneck_dim=self.hidden_state_token_bottleneck,
-                hidden_state_dim=self.hidden_state_dim,
-            )
             self.F_phi = F_phi(
                 hidden_dim=self.hidden_state_dim,
                 action_dim=self.hidden_state_action_dim,
             )
-            if self.hidden_state_observation_prediction:
-                self.observation_decoder = ObservationDecoder(
-                    hidden_dim=self.hidden_state_dim,
-                    target_dim=self.num_img * self.vlm_dim,
-                    decoder_hidden_dim=(
-                        self.hidden_state_observation_decoder_hidden_dim
-                    ),
-                )
+            # The filter route is the sole hidden-state implementation.  It
+            # constrains the token residual to ``B C_theta K_t e_t`` and keeps
+            # the original action path unchanged.
+            self.filter_correction = FilterCorrection(
+                token_dim=self.vlm_dim,
+                num_views=self.num_img,
+                hidden_state_dim=self.hidden_state_dim,
+                measure_dim=self.hidden_state_filter_measure_dim,
+                grid=self.hidden_state_filter_grid,
+                patch_grid=self.num_pat_img,
+                full_covariance=self.hidden_state_filter_full_covariance,
+                init_log_measure_noise=(
+                    self.hidden_state_filter_init_log_measure_noise
+                ),
+                seed=self.hidden_state_filter_seed,
+            )
 
         self.up0 = ConvexUpSample(
             in_dim=self.vlm_dim,
@@ -379,10 +384,9 @@ class MVT(nn.Module):
         :param img: tensor of shape (bs, num_img, img_feat_dim, h, w)
         :param img_aug: (float) magnitude of augmentation in rgb image
         :param rot_x_y: (bs, 2)
-        :param hidden_state_y: action-predicted prior or posterior state.
-        :param hidden_state_update: whether to apply U_omega to current tokens;
-            stage-two reuses the posterior from the first pass. The optional prior-observation
-            prediction is emitted only before U_omega on the first pass.
+        :param hidden_state_y: action-predicted prior or posterior belief.
+        :param hidden_state_update: whether to commit the filter posterior;
+            stage-two reuses the posterior from the first pass.
         """
 
         bs, num_img, img_feat_dim, h, w = img.shape
@@ -441,9 +445,7 @@ class MVT(nn.Module):
 
         auxiliary_outputs = {}
         if self.hidden_state_enabled:
-            # ``hidden_state_y`` is the action-predicted prior y_t^-.
-            # The optional observation decoder is evaluated before U_omega and
-            # receives this prior only; current tokens are a detached target.
+            # ``hidden_state_y`` is the action-predicted prior belief.
             if not hidden_state_update and hidden_state_y is None:
                 raise ValueError(
                     "hidden_state_y is required when hidden_state_update=False"
@@ -457,38 +459,61 @@ class MVT(nn.Module):
             else:
                 prior_hidden_state = hidden_state_y
 
-            if (
-                self.hidden_state_observation_prediction
-                and hidden_state_update
-                and self.training
-            ):
-                observation_target = pool_visual_tokens(
-                    current_tokens.detach(), self.num_img
-                ).detach()
-                observation_prediction, observation_nll = self.observation_decoder(
-                    prior_hidden_state,
-                    target=observation_target,
-                )
-                auxiliary_outputs.update(
-                    {
-                        "hidden_state_observation_prediction": observation_prediction,
-                        "hidden_state_observation_target": observation_target,
-                        "hidden_state_observation_nll": observation_nll,
-                    }
-                )
-
-            # U_omega consumes the current PaliGemma visual tokens H_t and
-            # produces the posterior y_t used by the token correction route.
+            # The carried state is the packed belief ``(mu, Sigma)``; current
+            # tokens are the measurement and the token residual is the
+            # structured innovation update ``B C_theta K_t e_t``.
+            prior_mean, prior_covariance = self.filter_correction.unpack_state(
+                prior_hidden_state
+            )
+            image_tokens, filtered = self.filter_correction(
+                current_tokens,
+                prior_mean,
+                prior_covariance,
+            )
             if hidden_state_update:
-                updated_hidden_state = self.U_omega(
-                    prior_hidden_state,
-                    current_tokens,
+                updated_hidden_state = self.filter_correction.pack_state(
+                    filtered["posterior_mean"],
+                    filtered["posterior_covariance"],
                 )
             else:
+                # Stage-two refines the same observation in another view
+                # space: correct its tokens from the carried belief, but keep
+                # one belief update per environment step.
                 updated_hidden_state = prior_hidden_state
-            image_tokens = self.A_psi(
-                current_tokens,
-                hidden_state_y=updated_hidden_state,
+            auxiliary_outputs.update(
+                {
+                    "hidden_state_filter_innovation_nll": filtered[
+                        "innovation_nll"
+                    ],
+                    "hidden_state_filter_innovation": filtered["innovation"],
+                    "hidden_state_filter_measurement": filtered["measurement"],
+                    "hidden_state_filter_delta_measurement": filtered[
+                        "delta_measurement"
+                    ],
+                    "hidden_state_filter_posterior_mean": filtered[
+                        "posterior_mean"
+                    ],
+                    "hidden_state_filter_posterior_covariance": filtered[
+                        "posterior_covariance"
+                    ],
+                    # Detached scalars for the §10.3 monitoring table.
+                    "hidden_state_filter_residual_ratio": filtered[
+                        "residual_ratio"
+                    ],
+                    "hidden_state_filter_posterior_trace": filtered[
+                        "posterior_trace"
+                    ],
+                    "hidden_state_filter_measure_noise_trace": filtered[
+                        "measure_noise_trace"
+                    ],
+                    "hidden_state_filter_process_noise_trace": filtered[
+                        "process_noise_trace"
+                    ],
+                    "hidden_state_filter_mean_correction_norm": filtered[
+                        "mean_correction_norm"
+                    ],
+                    "hidden_state_filter_alpha": filtered["alpha"],
+                }
             )
         else:
             # Keep the original BridgeVLA path byte-for-byte in spirit: no
@@ -639,17 +664,27 @@ class MVT(nn.Module):
         """Return the zero hidden state for a new episode or sequence."""
         if not self.hidden_state_enabled:
             return None
-        return self.F_phi.initial_hidden_state(
+        # Keep the belief in the trainable path's dtype (float32) rather than
+        # the bfloat16 token dtype, so the covariance stays well conditioned
+        # across an episode.
+        mean, covariance = self.filter_correction.initial_state(
             batch_size=batch_size,
             device=device,
-            dtype=dtype,
         )
+        return self.filter_correction.pack_state(mean, covariance)
 
     def update_hidden_state(self, hidden_state_y, action):
-        """Apply :math:`F_\\phi` after an executed waypoint."""
+        """Apply :math:`F_\\phi` after an executed waypoint.
+
+        On the filter route this also propagates the belief covariance, so the
+        next step receives the action-predicted prior ``(mu_t^-, Sigma_t^-)``.
+        """
         if not self.hidden_state_enabled:
             return hidden_state_y
-        return self.F_phi(hidden_state_y, action)
+        mean, covariance = self.filter_correction.unpack_state(hidden_state_y)
+        next_mean = self.F_phi(mean, action)
+        next_covariance = self.filter_correction.predict_covariance(covariance)
+        return self.filter_correction.pack_state(next_mean, next_covariance)
 
     def free_mem(self):
         """
@@ -657,6 +692,3 @@ class MVT(nn.Module):
         """
         print("Freeing up some memory")
         self.renderer.free_mem()
-
-
-

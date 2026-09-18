@@ -66,11 +66,12 @@ class MVT(nn.Module):
         hidden_state_enabled=False,
         hidden_state_dim=128,
         hidden_state_action_dim=8,
-        hidden_state_token_bottleneck=128,
-        hidden_state_update_heads=4,
-        hidden_state_update_dropout=0.0,
-        hidden_state_observation_prediction=False,
-        hidden_state_observation_decoder_hidden_dim=256,
+        hidden_state_filter_correction=False,
+        hidden_state_filter_measure_dim=64,
+        hidden_state_filter_grid=4,
+        hidden_state_filter_full_covariance=True,
+        hidden_state_filter_seed=0,
+        hidden_state_filter_init_log_measure_noise=48.0,
     ):
         super().__init__()
 
@@ -337,10 +338,9 @@ class MVT(nn.Module):
             (bs, 3)
         :param rot_x_y: (bs, 2) rotation in x and y direction
         :param language_goal: str (bs,)language instruction
-        :param hidden_state_y: action-predicted prior state, when enabled
-        :param hidden_state_update: apply U_omega on the first pass; stage-two
-            reuses that pass's posterior. The optional prior-observation target and
-            prediction are emitted only from the first pass.
+        :param hidden_state_y: action-predicted prior belief, when enabled
+        :param hidden_state_update: commit the filter posterior on the first
+            pass; stage-two reuses that pass's posterior.
         """
         self.verify_inp(
             pc=pc,
@@ -370,9 +370,9 @@ class MVT(nn.Module):
         else:
             wpt_local_stage_one = wpt_local
 
-        # U_omega is applied on the first pass.  Stage-two reuses that
+        # The filter is applied on the first pass. Stage-two reuses that
         # posterior while refining the same observation in a second view-space
-        # pass, so one environment step still performs one observation update.
+        # pass, so one environment step still performs one belief update.
         mvt1_kwargs = dict(kwargs)
         mvt1_kwargs["hidden_state_y"] = hidden_state_y
         mvt1_kwargs["hidden_state_update"] = hidden_state_update
@@ -470,7 +470,7 @@ class MVT(nn.Module):
         
             if self.mvt1.hidden_state_enabled:
                 # The second MVT pass is a view-space refinement of the same
-                # observation.  Apply U_omega only once per environment step;
+                # observation. Apply the filter only once per environment step;
                 # reuse the posterior from the first pass here.
                 mvt2_kwargs["hidden_state_y"] = out["hidden_state_y"]
                 mvt2_kwargs["hidden_state_update"] = False

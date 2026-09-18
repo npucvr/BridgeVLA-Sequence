@@ -32,18 +32,19 @@ _C.st_wpt_loc_aug = 0.05
 _C.st_wpt_loc_inp_no_noise = False
 _C.img_aug_2 = 0.0
 _C.paligemma_path = ""
-# Optional probabilistic hidden-state route. Disabled to preserve the original
+# Optional filter hidden-state route. Disabled to preserve the original
 # BridgeVLA checkpoint structure and forward path by default.
 _C.hidden_state_enabled = False
 _C.hidden_state_dim = 128
 _C.hidden_state_action_dim = 8
-_C.hidden_state_token_bottleneck = 128
-_C.hidden_state_update_heads = 4
-_C.hidden_state_update_dropout = 0.0
-# Optional causal prior-observation prediction. The decoder sees only y_t^-;
-# the current visual-token feature is a detached training target.
-_C.hidden_state_observation_prediction = False
-_C.hidden_state_observation_decoder_hidden_dim = 256
+# Filter-style token correction. The only supported hidden-state route replaces
+# the old arbitrary residual path with a measurement-space Bayes update.
+_C.hidden_state_filter_correction = False
+_C.hidden_state_filter_measure_dim = 64
+_C.hidden_state_filter_grid = 4
+_C.hidden_state_filter_full_covariance = True
+_C.hidden_state_filter_seed = 0
+_C.hidden_state_filter_init_log_measure_noise = 48.0
 
 
 def get_cfg_defaults():
