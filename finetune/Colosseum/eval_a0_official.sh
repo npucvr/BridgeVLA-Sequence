@@ -2,11 +2,24 @@
 # gbw____
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/data2/local_userdata/gaobowen/VLA/BridgeVLA-Sequence}"
+# gbw____
+# 默认从当前共享工作区推导路径，避免 remote 节点继续回落到旧 /data2。
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}"
+# ____
 CONDA_BASE="${CONDA_BASE:-/home/gaobowen/anaconda3}"
 CONDA_ENV="${CONDA_ENV:-bridgevla_plus_rlbench}"
 PYTHON_BIN="${PYTHON_BIN:-$CONDA_BASE/envs/$CONDA_ENV/bin/python}"
-DATASET_ROOT="${DATASET_ROOT:-$PROJECT_ROOT/data/datasets/colosseum_eval}"
+# gbw____
+# COLOSSEUM_DATASET_ROOT 是 benchmark 专用覆盖项。若当前 shell 之前
+# source 过 RLBench activate.sh，它会遗留 */rl_eval；此时不能把 RLBench
+# 数据误当作 Colosseum 数据。若确实要使用特殊路径，请显式设置
+# COLOSSEUM_DATASET_ROOT。
+COLOSSEUM_DATASET_ROOT="${COLOSSEUM_DATASET_ROOT:-$PROJECT_ROOT/data/datasets/colosseum_eval}"
+if [[ -z "${DATASET_ROOT:-}" || "${DATASET_ROOT}" == */rl_eval ]]; then
+    DATASET_ROOT="$COLOSSEUM_DATASET_ROOT"
+fi
+# ____
 MODEL_FOLDER="${MODEL_FOLDER:-$PROJECT_ROOT/data/ckpt/colosseum}"
 MODEL_NAME="${MODEL_NAME:-model_80.pth}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/outputs/colosseum_a0_official}"
@@ -48,8 +61,21 @@ OFFICIAL_WORKAROUND="${OFFICIAL_WORKAROUND:-1}"
 OFFICIAL_WORKAROUND_MAX_ATTEMPTS="${OFFICIAL_WORKAROUND_MAX_ATTEMPTS:-250}"
 OFFICIAL_WORKAROUND_SOURCE_EPISODES="${OFFICIAL_WORKAROUND_SOURCE_EPISODES:-25}"
 # ____
-REF_ROOT="${REF_ROOT:-/data2/local_userdata/gaobowen/VLA/bridgevla}"
-COPPELIASIM_ROOT="${COPPELIASIM_ROOT:-$REF_ROOT/finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04}"
+# gbw____
+# REF_ROOT/BRIDGEVLA_LIBS_ROOT 可由节点配置覆盖；默认使用当前共享仓库
+# 的 runtime。这样 Colosseum 入口与 RLBench 入口不会隐式依赖 /data2。
+REF_ROOT="${REF_ROOT:-$PROJECT_ROOT}"
+BRIDGEVLA_LIBS_ROOT="${BRIDGEVLA_LIBS_ROOT:-$PROJECT_ROOT/finetune/bridgevla/libs}"
+# gbw____
+if [[ -z "${COPPELIASIM_ROOT:-}" ]]; then
+    if [[ -d "$REF_ROOT/finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04" ]]; then
+        COPPELIASIM_ROOT="$REF_ROOT/finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04"
+    else
+        COPPELIASIM_ROOT="$PROJECT_ROOT/finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04"
+    fi
+fi
+# ____
+# ____
 BRIDGEVLA_PALIGEMMA_PATH="${BRIDGEVLA_PALIGEMMA_PATH:-$PROJECT_ROOT/data/ckpt/paligemma}"
 
 # gbw____
@@ -71,6 +97,27 @@ test -f "$MANIFEST"
 command -v xvfb-run >/dev/null
 command -v jq >/dev/null
 
+# gbw____
+# 历史 manifest 可能保存旧工作区的绝对 eval_datafolder。manifest 的
+# episode/task 选择仍然有效，但运行路径必须映射到当前节点的数据根目录。
+MANIFEST_DATA_ROOT="$(jq -r '.data_root // ""' "$MANIFEST")"
+remap_manifest_datafolder() {
+    local manifest_path="$1"
+    local relative_path=""
+    local remapped_path=""
+    if [[ -n "$MANIFEST_DATA_ROOT" && "$manifest_path" == "$MANIFEST_DATA_ROOT/"* ]]; then
+        relative_path="${manifest_path#"$MANIFEST_DATA_ROOT/"}"
+        remapped_path="$DATASET_ROOT/$relative_path"
+    elif [[ "$manifest_path" == /* ]]; then
+        remapped_path="$DATASET_ROOT/$(basename "$manifest_path")"
+    fi
+    if [[ -n "$remapped_path" && -d "$remapped_path" ]]; then
+        printf '%s' "$remapped_path"
+    else
+        printf '%s' "$manifest_path"
+    fi
+}
+# ____
 # gbw____
 # Expand the user-facing variation selector once, before reading the manifest.
 # This prevents the old comma-only case expression from silently selecting no
@@ -148,7 +195,34 @@ export BRIDGEVLA_PALIGEMMA_PATH
 export LD_LIBRARY_PATH="$COPPELIASIM_ROOT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export QT_QPA_PLATFORM_PLUGIN_PATH="$COPPELIASIM_ROOT"
 export PYTHONDONTWRITEBYTECODE=1
-export PYTHONPATH="$PROJECT_ROOT/finetune:$REF_ROOT/finetune/bridgevla/libs/RLBench_peract587:$REF_ROOT/finetune/bridgevla/libs/PyRep_stepjam231:$REF_ROOT/finetune/bridgevla/libs/YARR:$REF_ROOT/finetune/bridgevla/libs/peract_colab:$REF_ROOT/finetune/bridgevla/libs/point-renderer:$PROJECT_ROOT/finetune/Colosseum/robot-colosseum${PYTHONPATH:+:$PYTHONPATH}"
+# gbw____
+# 远程仓库默认使用标准 runtime；若节点显式提供含有 Colosseum 原始
+# 特殊库名的 reference runtime，则把它放在前面，并保留共享仓库作为
+# fallback。这样不会把某个节点的 reference 路径写死进模型逻辑。
+COLOSSEUM_LIB_PATHS=(
+    "$BRIDGEVLA_LIBS_ROOT/PyRep"
+    "$BRIDGEVLA_LIBS_ROOT/RLBench"
+    "$BRIDGEVLA_LIBS_ROOT/YARR"
+    "$BRIDGEVLA_LIBS_ROOT/peract"
+    "$BRIDGEVLA_LIBS_ROOT/peract_colab"
+    "$BRIDGEVLA_LIBS_ROOT/point-renderer"
+)
+if [[ -d "$REF_ROOT/finetune/bridgevla/libs/RLBench_peract587" ]]; then
+    COLOSSEUM_LIB_PATHS=(
+        "$REF_ROOT/finetune/bridgevla/libs/RLBench_peract587"
+        "$REF_ROOT/finetune/bridgevla/libs/PyRep_stepjam231"
+        "$REF_ROOT/finetune/bridgevla/libs/YARR"
+        "$REF_ROOT/finetune/bridgevla/libs/peract_colab"
+        "$REF_ROOT/finetune/bridgevla/libs/point-renderer"
+        "${COLOSSEUM_LIB_PATHS[@]}"
+    )
+fi
+COLOSSEUM_SAVED_IFS="$IFS"
+IFS=:
+COLOSSEUM_LIB_PATHS_TEXT="${COLOSSEUM_LIB_PATHS[*]}"
+IFS="$COLOSSEUM_SAVED_IFS"
+export PYTHONPATH="$PROJECT_ROOT/finetune:$COLOSSEUM_LIB_PATHS_TEXT:$PROJECT_ROOT/finetune/Colosseum/robot-colosseum${PYTHONPATH:+:$PYTHONPATH}"
+# ____
 
 mkdir -p "$OUTPUT_ROOT"
 cd "$PROJECT_ROOT/finetune/Colosseum"
@@ -240,6 +314,9 @@ for ((repeat = REPEAT_START; repeat < REPEAT_START + REPEATS; repeat++)); do
         if [[ "$VARIATION_FILTER" != "all" && -z "${SELECTED_VARIATIONS[$variation_id]+selected}" ]]; then
             continue
         fi
+        # gbw____
+        eval_datafolder="$(remap_manifest_datafolder "$eval_datafolder")"
+        # ____
         # gbw____
         if [[ "$OFFICIAL_WORKAROUND" == "1" ]] && is_official_workaround_cell "$base_task" "$variation_id"; then
             echo "[skip-workaround-cell] repeat=$repeat task=${base_task}_${variation_id}"

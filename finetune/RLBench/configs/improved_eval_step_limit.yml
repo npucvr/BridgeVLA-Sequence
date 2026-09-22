@@ -1,0 +1,22 @@
+# gbw____
+# BridgeVLA++ 评测侧逐任务 action/keypose budget。
+# 这不是低层仿真步数；它是 policy 最多可以输出的动作次数。
+close_jar: 25
+reach_and_drag: 25
+insert_onto_square_peg: 25
+meat_off_grill: 25
+open_drawer: 25
+place_wine_at_rack_location: 25
+push_buttons: 25
+put_groceries_in_cupboard: 25
+put_item_in_drawer: 25
+put_money_in_safe: 25
+light_bulb_in: 25
+slide_block_to_color_target: 25
+place_shape_in_shape_sorter: 25
+stack_blocks: 35
+stack_cups: 25
+place_cups: 35
+sweep_to_dustpan_of_size: 25
+turn_tap: 25
+# ____

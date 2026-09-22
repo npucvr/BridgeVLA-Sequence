@@ -9,6 +9,9 @@ __pycache__/
 finetune/RLBench/archive/
 *.tar.gz
 *.pyc
+*.sh
+*.conf
+*.log
 
 AGENTS.md
 
@@ -17,3 +20,7 @@ AGENTS.md
 /finetune/user_xvfb/
 /finetune/bridgevla/libs/PyRep/
 /finetune/bridgevla/libs/RLBench/
+
+/finetune/RLBench/merge_sharded_improved_repeat.py
+/finetune/RLBench/run_a2_improved_iterative.py
+/finetune/RLBench/run_a2_rlbench_only.py

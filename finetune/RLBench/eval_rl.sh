@@ -30,6 +30,12 @@ FILTER_MODE="${FILTER_MODE:-none}"
 FILTER_DIAGNOSTICS="${FILTER_DIAGNOSTICS:-0}"
 FILTER_DIAGNOSTICS_SHADOW_RAW="${FILTER_DIAGNOSTICS_SHADOW_RAW:-0}"
 # gbw____
+# metric audit 是独立的 raw-token 观测旁路；开启时仍保持 FILTER_MODE=none
+# 的原始 token 输出，不启用正式 filter diagnostics 或 Kalman 更新。
+FILT3R_METRIC_AUDIT="${FILT3R_METRIC_AUDIT:-0}"
+FILT3R_METRIC_AUDIT_PATH="${FILT3R_METRIC_AUDIT_PATH:-}"
+# ____
+# gbw____
 FILT3R_STAGES="${FILT3R_STAGES:-1}"
 # gbw____
 # 下面三项共同定义当前 A1 baseline 的默认路径：
@@ -46,6 +52,7 @@ FILT3R_DRIFT_SCOPE="${FILT3R_DRIFT_SCOPE:-global_token_median}"
 # R0 calibration can set FILT3R_R and FILT3R_P_INIT_RATIO together;
 # the Python adapter derives P_init=R*ratio when the ratio is non-empty.
 FILT3R_R="${FILT3R_R:-1.0}"
+FILT3R_P_INIT="${FILT3R_P_INIT:-1.5}"
 FILT3R_P_INIT_RATIO="${FILT3R_P_INIT_RATIO:-}"
 # gbw____
 # A3: jitter-aware full-channel measurement covariance. fixed 是 A1/A2
@@ -67,6 +74,17 @@ FILT3R_Q_MIN="${FILT3R_Q_MIN:-0.5}"
 FILT3R_Q_MAX="${FILT3R_Q_MAX:-35.6}"
 FILT3R_Q_SIGMOID_ALPHA="${FILT3R_Q_SIGMOID_ALPHA:-4.0}"
 FILT3R_Q_SIGMOID_TAU="${FILT3R_Q_SIGMOID_TAU:-1.0}"
+# gbw____
+# A2-W4 的四帧 raw-token evidence 开关；none/1 保持旧单帧路径，4 才启用
+# 最近四帧的 robust Q 统计。窗口只影响 Q，不改变当前输出时刻。
+FILT3R_Q_WINDOW_SIZE="${FILT3R_Q_WINDOW_SIZE:-1}"
+FILT3R_Q_WINDOW_MODE="${FILT3R_Q_WINDOW_MODE:-none}"
+FILT3R_Q_WINDOW_PERSISTENCE_ALPHA="${FILT3R_Q_WINDOW_PERSISTENCE_ALPHA:-4.0}"
+FILT3R_Q_WINDOW_PERSISTENCE_TAU="${FILT3R_Q_WINDOW_PERSISTENCE_TAU:-1.0}"
+FILT3R_Q_WINDOW_ISOLATED_ALPHA="${FILT3R_Q_WINDOW_ISOLATED_ALPHA:-4.0}"
+FILT3R_Q_WINDOW_ISOLATED_TAU="${FILT3R_Q_WINDOW_ISOLATED_TAU:-0.5}"
+FILT3R_Q_WINDOW_DOWN_WEIGHT="${FILT3R_Q_WINDOW_DOWN_WEIGHT:-0.5}"
+# ____
 # gbw____
 # Gain-space A2：目标 gain 的 bounded-sigmoid 与由 gain 反解 Q/R 的安全范围。
 # 这些变量只在 FILT3R_Q_MODE=gain_space_adaptive 时生效。
@@ -153,6 +171,11 @@ OUTPUT_DIR="$(realpath -m "$OUTPUT_DIR")"
 if [[ -n "${FILTER_DIAGNOSTICS_PATH:-}" ]]; then
     FILTER_DIAGNOSTICS_PATH="$(realpath -m "$FILTER_DIAGNOSTICS_PATH")"
 fi
+# gbw____
+if [[ -n "${FILT3R_METRIC_AUDIT_PATH:-}" ]]; then
+    FILT3R_METRIC_AUDIT_PATH="$(realpath -m "$FILT3R_METRIC_AUDIT_PATH")"
+fi
+# ____
 export OUTPUT_DIR
 # ____
 # gbw____
@@ -160,6 +183,12 @@ if [[ "$FILTER_DIAGNOSTICS" == "1" ]]; then
     FILTER_DIAGNOSTICS_PATH="${FILTER_DIAGNOSTICS_PATH:-$OUTPUT_DIR/filt3r_diagnostics.jsonl}"
     export FILTER_DIAGNOSTICS_PATH
 fi
+# gbw____
+if [[ "$FILT3R_METRIC_AUDIT" == "1" ]]; then
+    FILT3R_METRIC_AUDIT_PATH="${FILT3R_METRIC_AUDIT_PATH:-$OUTPUT_DIR/metric_audit.jsonl}"
+    export FILT3R_METRIC_AUDIT_PATH
+fi
+# ____
 # ____
 
 export DATASET_ROOT MODEL_PATH EXP_CFG_PATH MVT_CFG_PATH PALIGEMMA_PATH OUTPUT_DIR
@@ -173,13 +202,16 @@ export SAVE_VIDEO VISUALIZE SAVE_MULTIVIEW MULTIVIEW_SIZE
 export FILTER_MODE FILTER_DIAGNOSTICS
 export FILTER_DIAGNOSTICS_SHADOW_RAW
 # gbw____
+export FILT3R_METRIC_AUDIT FILT3R_METRIC_AUDIT_PATH
+# ____
+# gbw____
 export FILT3R_STAGES FILT3R_Q_MODE FILT3R_JITTER_WEIGHT
 export FILT3R_MAX_TOKEN_SHIFT_RATIO FILT3R_RESET_MODE
 # gbw____
 export FILT3R_DRIFT_SCOPE
 # ____
 # gbw____
-export FILT3R_R FILT3R_P_INIT_RATIO
+export FILT3R_R FILT3R_P_INIT FILT3R_P_INIT_RATIO
 # ____
 # gbw____
 export FILT3R_R_MODE FILT3R_JITTER_R_LAMBDA FILT3R_JITTER_R_MAX
@@ -189,6 +221,12 @@ export FILT3R_Q_USE_ADAPTIVE_R
 # gbw____
 export FILT3R_Q_MIN FILT3R_Q_MAX FILT3R_Q_SIGMOID_ALPHA
 export FILT3R_Q_SIGMOID_TAU FILT3R_DRIFT_EMA_BETA
+# gbw____
+export FILT3R_Q_WINDOW_SIZE FILT3R_Q_WINDOW_MODE
+export FILT3R_Q_WINDOW_PERSISTENCE_ALPHA FILT3R_Q_WINDOW_PERSISTENCE_TAU
+export FILT3R_Q_WINDOW_ISOLATED_ALPHA FILT3R_Q_WINDOW_ISOLATED_TAU
+export FILT3R_Q_WINDOW_DOWN_WEIGHT
+# ____
 # gbw____
 export FILT3R_GAIN_K_DELTA FILT3R_GAIN_SIGMOID_ALPHA
 export FILT3R_GAIN_SIGMOID_TAU FILT3R_GAIN_K_MIN FILT3R_GAIN_K_MAX
@@ -273,6 +311,19 @@ import sys
 import torch
 # ____
 
+# gbw____
+# 多 shard 分散到不同主机时，仍需限制每个 Python 进程的 CPU 线程池，
+# 否则图像解码、token 统计和仿真辅助线程会在同一节点过度竞争。默认
+# 不设置时完全保留原入口行为。
+cpu_threads_text = os.environ.get("BRIDGEVLA_CPU_THREADS", "").strip()
+if cpu_threads_text:
+    cpu_threads = int(cpu_threads_text)
+    if cpu_threads < 1:
+        raise ValueError("BRIDGEVLA_CPU_THREADS must be positive")
+    torch.set_num_threads(cpu_threads)
+    torch.set_num_interop_threads(cpu_threads)
+# ____
+
 from eval import eval as run_eval
 from eval import load_agent
 
@@ -355,6 +406,10 @@ summary = {
     # gbw____
     "filter_mode": os.environ["FILTER_MODE"],
     "filter_diagnostics_path": os.environ.get("FILTER_DIAGNOSTICS_PATH"),
+    # gbw____
+    "metric_audit_enabled": os.environ.get("FILT3R_METRIC_AUDIT") == "1",
+    "metric_audit_path": os.environ.get("FILT3R_METRIC_AUDIT_PATH"),
+    # ____
     "filter_config": filter_config,
     # gbw____
     "seed_policy": "EVAL_SEED selects a deterministic 25-episode subset; eval_demo_seed is the sorted dataset position",

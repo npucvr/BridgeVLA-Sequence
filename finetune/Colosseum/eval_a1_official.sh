@@ -2,8 +2,15 @@
 # gbw____
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/data2/local_userdata/gaobowen/VLA/BridgeVLA-Sequence}"
+# gbw____
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd -- "$SCRIPT_DIR/../.." && pwd)}"
+# ____
 OUTPUT_ROOT="${OUTPUT_ROOT:-$PROJECT_ROOT/outputs/colosseum_a1_official}"
+# gbw____
+COLOSSEUM_DATASET_ROOT="${COLOSSEUM_DATASET_ROOT:-$PROJECT_ROOT/data/datasets/colosseum_eval}"
+export COLOSSEUM_DATASET_ROOT
+# ____
 REPEATS="${REPEATS:-3}"
 REPEAT_START="${REPEAT_START:-0}"
 

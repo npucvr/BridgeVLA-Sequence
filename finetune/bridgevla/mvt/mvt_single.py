@@ -285,6 +285,13 @@ class MVT(nn.Module):
         self._last_filt3r_diagnostics = None
         # gbw____
         self._last_filt3r_raw_shadow_waypoint = None
+        # gbw____
+        # Idea 1 的 callback 在 filter commit 前计算 raw/proposal decoder 账本。
+        # 这些值只服务当前 forward 的 diagnostics 和下一步 waypoint 记录，
+        # 不会作为新的 temporal state 保存。
+        # ____
+        self._last_decoder_protection_raw_trans = None
+        self._last_decoder_protection_raw_waypoint = None
         # ____
         # ____
         global select_feat_from_hm
@@ -362,6 +369,9 @@ class MVT(nn.Module):
         assert h == w == self.img_size
         # gbw____
         self._last_filt3r_raw_shadow_waypoint = None
+        # gbw____
+        self._last_decoder_protection_raw_trans = None
+        self._last_decoder_protection_raw_waypoint = None
         # ____
         # gbw____
         temporal_step = kwargs.pop("temporal_step", None)
@@ -485,10 +495,48 @@ class MVT(nn.Module):
         # 训练阶段不允许启用 temporal filter，因为 state 是推理时按时间步维护的，
         # 不能把跨样本、跨 batch 的历史状态带入训练反向传播。
         # ____
+        # gbw____
+        # 已归档：metric audit 旁路不再运行。主脚本只保留
+        # diagonal_robust_mahalanobis，record_metric_audit() 当前为空兼容接口。
+        # 原调用保留为注释，便于追溯，不再生成 9 路 metric 记录。
+        # raw_canonical_tokens 只在实际 Stage-1 filter 路径中构造。
+        # if self._filt3r_token_filter.metric_audit_enabled or (...):
+        #     ... record_metric_audit(...)
+        # ____
+        raw_canonical_tokens = None
+        if self._filt3r_token_filter.enabled_for_stage(filter_stage):
+            raw_canonical_tokens = rearrange(
+                image_tokens,
+                "b (c h1 h2) d -> b c h1 h2 d",
+                c=self.num_img,
+                h1=self.num_pat_img,
+                h2=self.num_pat_img,
+            )
         if self._filt3r_token_filter.enabled and self.training:
             raise RuntimeError(
                 "FILTER_MODE=filt3r_akf is inference-only for A1"
             )
+        decoder_gate = None
+        if (
+            self._filt3r_token_filter.decoder_protection_enabled
+            and self._filt3r_token_filter.enabled_for_stage(filter_stage)
+        ):
+            # gbw____
+            # decoder_gate 是一次 proposal/commit 之间的只读检查。它使用
+            # 当前 raw candidate 与尚未提交的 filtered proposal，因而不会
+            # 读取未来帧、task label 或 success；filter 在 callback 返回后
+            # 才提交最终 token 和对应 covariance。
+            # ____
+            def decoder_gate(candidate, proposal, allowed_mask):
+                return self._decoder_protection_gate(
+                    candidate,
+                    proposal,
+                    allowed_mask,
+                    bs=bs,
+                    h=h,
+                    w=w,
+                )
+
         if self._filt3r_token_filter.enabled_for_stage(filter_stage):
             # gbw____
             # 过滤路径：先把序列布局恢复成 canonical Z_t=(B,3,16,16,2048)，
@@ -497,16 +545,11 @@ class MVT(nn.Module):
             # ____
             # raw_canonical_tokens 是当前帧 measurement Z_t。
             # ____
-            raw_canonical_tokens = rearrange(
-                image_tokens,
-                "b (c h1 h2) d -> b c h1 h2 d",
-                c=self.num_img,
-                h1=self.num_pat_img,
-                h2=self.num_pat_img,
-            )
             canonical_tokens = raw_canonical_tokens
             canonical_tokens = self._filt3r_token_filter.apply(
-                canonical_tokens, stage=filter_stage
+                canonical_tokens,
+                stage=filter_stage,
+                decoder_gate=decoder_gate,
             )
             self._last_filt3r_diagnostics = (
                 self._filt3r_token_filter.last_diagnostics
@@ -562,8 +605,10 @@ class MVT(nn.Module):
         # state，也不参与最终 action。正常运行只使用上面的 filtered trans。
         # ____
         # gbw____
-        raw_shadow_trans = None
+        raw_shadow_trans = self._last_decoder_protection_raw_trans
         if (
+            raw_shadow_trans is None
+            and
             self._filt3r_token_filter.shadow_raw_enabled
             and self._filt3r_token_filter.enabled_for_stage(filter_stage)
         ):
@@ -584,6 +629,10 @@ class MVT(nn.Module):
                 out={"trans": raw_shadow_trans.clone().detach()},
                 dyn_cam_info=None,
             )
+        elif raw_shadow_trans is not None and self._filt3r_token_filter.shadow_raw_enabled:
+            self._last_filt3r_raw_shadow_waypoint = (
+                self._last_decoder_protection_raw_waypoint
+            )
         # ____
         # gbw____
         # 记录 filtered heatmap 的 peak、margin、entropy；如果启用了 shadow，同时记录
@@ -591,7 +640,11 @@ class MVT(nn.Module):
         self._filt3r_token_filter.record_output_diagnostics(
             trans,
             stage=filter_stage,
-            raw_logits=raw_shadow_trans,
+            raw_logits=(
+                raw_shadow_trans
+                if self._filt3r_token_filter.shadow_raw_enabled
+                else None
+            ),
         )
         # ____
 
@@ -733,6 +786,150 @@ class MVT(nn.Module):
         assert y_q is None
 
         return pred_wpt
+
+    # gbw____
+    def _decoder_protection_gate(
+        self,
+        candidate: torch.Tensor,
+        proposal: torch.Tensor,
+        allowed_mask: torch.Tensor,
+        *,
+        bs: int,
+        h: int,
+        w: int,
+    ) -> dict:
+        # gbw____
+        # 已归档：stage 参数未参与 gate 判定；当前 gate 只接受同帧 decoder 证据。
+        # ____
+        """Choose a bounded token proposal using only same-frame decoder evidence.
+
+        The gate is deliberately conservative: a sample is protected only when
+        the raw decoder has a sufficiently separated peak, the filtered proposal
+        loses margin, and the proposal moves either a heatmap peak or the decoded
+        waypoint. The returned alpha is token-shaped so the filter can update its
+        effective gain and covariance before committing state.
+        """
+
+        def decode(canonical: torch.Tensor) -> torch.Tensor:
+            x = canonical.permute(0, 4, 1, 2, 3)
+            x = (
+                x.transpose(1, 2)
+                .contiguous()
+                .view(
+                    bs * self.num_img,
+                    self.vlm_dim,
+                    self.num_pat_img,
+                    self.num_pat_img,
+                )
+                .to(torch.float32)
+            )
+            return self.up0(x).view(bs, self.num_img, h, w)
+
+        def local_peak_stats(logits: torch.Tensor, radius: int) -> dict:
+            # gbw____
+            # top-two global pixels 常常属于同一个相邻 peak，不能作为
+            # decoder confidence。这里因果地抑制当前 peak 的固定局部邻域，
+            # 再取第二个 distinct peak；radius 是固定 inference 超参数。
+            # ____
+            probs = torch.softmax(logits.detach().float(), dim=-1)
+            peak_value, peak_index = probs.flatten(-2).max(dim=-1)
+            peak_y = torch.div(peak_index, logits.shape[-1], rounding_mode="floor")
+            peak_x = peak_index.remainder(logits.shape[-1])
+            yy = torch.arange(
+                logits.shape[-2], device=logits.device
+            ).view(1, 1, -1, 1)
+            xx = torch.arange(
+                logits.shape[-1], device=logits.device
+            ).view(1, 1, 1, -1)
+            neighborhood = (
+                (yy - peak_y[..., None, None]).abs() <= radius
+            ) & ((xx - peak_x[..., None, None]).abs() <= radius)
+            masked = probs.masked_fill(neighborhood, -1.0)
+            second_value = masked.flatten(-2).max(dim=-1).values.clamp_min(0.0)
+            return {
+                "peak": peak_value,
+                "margin": peak_value - second_value,
+                "peak_xy": torch.stack((peak_x, peak_y), dim=-1),
+            }
+
+        with torch.no_grad():
+            raw_logits = decode(candidate)
+            proposal_logits = decode(proposal)
+            peak_radius = int(
+                os.environ.get("FILT3R_DECODER_PEAK_EXCLUSION_RADIUS", "3")
+            )
+            if peak_radius < 1:
+                raise ValueError(
+                    "FILT3R_DECODER_PEAK_EXCLUSION_RADIUS must be >= 1"
+                )
+            raw_stats = local_peak_stats(raw_logits, peak_radius)
+            proposal_stats = local_peak_stats(proposal_logits, peak_radius)
+            raw_margin = raw_stats["margin"].mean(dim=1)
+            filtered_margin = proposal_stats["margin"].mean(dim=1)
+            peak_shift = torch.linalg.vector_norm(
+                proposal_stats["peak_xy"].float()
+                - raw_stats["peak_xy"].float(),
+                dim=-1,
+            ).mean(dim=1)
+            raw_waypoint = self.get_wpt(
+                out={"trans": raw_logits}, dyn_cam_info=None
+            )
+            proposal_waypoint = self.get_wpt(
+                out={"trans": proposal_logits}, dyn_cam_info=None
+            )
+            waypoint_shift = torch.linalg.vector_norm(
+                proposal_waypoint.float() - raw_waypoint.float(), dim=-1
+            )
+
+            raw_margin_tau = float(
+                os.environ.get("FILT3R_DECODER_RAW_MARGIN_TAU", "0.004")
+            )
+            margin_ratio_tau = float(
+                os.environ.get("FILT3R_DECODER_MARGIN_RATIO", "0.75")
+            )
+            peak_shift_tau = float(
+                os.environ.get("FILT3R_DECODER_PEAK_SHIFT_TAU", "0.5")
+            )
+            waypoint_shift_tau = float(
+                os.environ.get("FILT3R_DECODER_WAYPOINT_SHIFT_TAU", "0.05")
+            )
+            protection_alpha_value = float(
+                os.environ.get("FILT3R_DECODER_PROTECTION_ALPHA", "0.5")
+            )
+            if not 0.0 <= protection_alpha_value <= 1.0:
+                raise ValueError(
+                    "FILT3R_DECODER_PROTECTION_ALPHA must be in [0, 1]"
+                )
+            protection_mask = (
+                allowed_mask
+                & (raw_margin >= raw_margin_tau)
+                & (filtered_margin <= raw_margin * margin_ratio_tau)
+                & (
+                    (peak_shift >= peak_shift_tau)
+                    | (waypoint_shift >= waypoint_shift_tau)
+                )
+            )
+            alpha = torch.ones_like(allowed_mask, dtype=torch.float32)
+            alpha = torch.where(
+                protection_mask,
+                torch.full_like(alpha, protection_alpha_value),
+                alpha,
+            )
+
+            self._last_decoder_protection_raw_trans = raw_logits.detach()
+            self._last_decoder_protection_raw_waypoint = raw_waypoint.detach()
+            if self._filt3r_token_filter.shadow_raw_enabled:
+                self._last_filt3r_raw_shadow_waypoint = raw_waypoint.detach()
+
+        return {
+            "alpha": alpha,
+            "protection_mask": protection_mask,
+            "raw_margin": raw_margin,
+            "filtered_margin": filtered_margin,
+            "peak_shift": peak_shift,
+            "waypoint_shift": waypoint_shift,
+        }
+    # ____
 
     # gbw____
     def get_filt3r_diagnostics(self):

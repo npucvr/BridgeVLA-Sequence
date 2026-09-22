@@ -244,9 +244,17 @@ def _print_summary(manifest: Dict[str, object]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    # gbw____
+    # 默认数据路径跟随当前共享工作区；正式多节点运行时仍可用
+    # --data-root 显式指定节点本地 hot data。
+    default_project_root = Path(__file__).resolve().parents[2]
+    default_data_root = default_project_root / "data/datasets/colosseum_eval"
+    # ____
     parser.add_argument(
         "--data-root",
-        default="/data2/local_userdata/gaobowen/VLA/BridgeVLA-Sequence/data/datasets/colosseum_eval",
+        # gbw____
+        default=default_data_root,
+        # ____
         type=Path,
     )
     parser.add_argument(

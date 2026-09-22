@@ -4,7 +4,12 @@ from typing import List, Callable
 import numpy as np
 from pyrep import PyRep
 from pyrep.const import ObjectType
-from rlbench import utils
+# gbw____
+# Colosseum 归档采用“base_task/task_variant/variation0/episodes”的布局，
+# 并且不保存 overhead 相机目录；项目内的 Colosseum loader 已针对这个
+# 布局做了最小适配。不能调用通用 RLBench loader。
+from utils import colosseum_utils as utils
+# ____
 from rlbench.action_modes.action_mode import ActionMode
 from rlbench.backend.exceptions import BoundaryError, WaypointError, \
     TaskEnvironmentError
@@ -53,11 +58,14 @@ class TaskEnvironmentExt(TaskEnvironment):
             # Keeping image loading disabled also avoids changing the shared
             # RLBench loader used by the other benchmarks.
             # ____
+            # gbw____
+            # image_paths 已由当前调用方控制；Colosseum loader 与本项目
+            # RLBench fork 的签名一致，不接受不存在的 load_images 关键字。
+            # ____
             demos = utils.get_stored_demos(
                 amount, image_paths, self._dataset_root, self._variation_number,
                 self._task.task_path, self._obs_config,
-                random_selection, from_episode_number,
-                load_images=False)
+                random_selection, from_episode_number)
         else:
             ctr_loop = self._robot.arm.joints[0].is_control_loop_enabled()
             self._robot.arm.set_control_loop_enabled(True)
