@@ -24,3 +24,4 @@ AGENTS.md
 /finetune/RLBench/merge_sharded_improved_repeat.py
 /finetune/RLBench/run_a2_improved_iterative.py
 /finetune/RLBench/run_a2_rlbench_only.pyfinetune/RLBench/archive/
+archive/
