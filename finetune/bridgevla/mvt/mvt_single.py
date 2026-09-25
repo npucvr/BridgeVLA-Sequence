@@ -77,6 +77,10 @@ class MVT(nn.Module):
         hidden_state_filter_full_covariance=True,
         hidden_state_filter_seed=0,
         hidden_state_filter_init_log_measure_noise=48.0,
+        hidden_state_filter_per_cell_alpha=True,
+        hidden_state_filter_measure_adapter=True,
+        hidden_state_filter_nonlinear_measure=True,
+        hidden_state_filter_measure_rank=16,
     ):
         super().__init__()
         self.depth = depth
@@ -153,6 +157,16 @@ class MVT(nn.Module):
         self.hidden_state_filter_init_log_measure_noise = float(
             hidden_state_filter_init_log_measure_noise
         )
+        self.hidden_state_filter_per_cell_alpha = bool(
+            hidden_state_filter_per_cell_alpha
+        )
+        self.hidden_state_filter_measure_adapter = bool(
+            hidden_state_filter_measure_adapter
+        )
+        self.hidden_state_filter_nonlinear_measure = bool(
+            hidden_state_filter_nonlinear_measure
+        )
+        self.hidden_state_filter_measure_rank = int(hidden_state_filter_measure_rank)
         if self.hidden_state_dim < 1:
             raise ValueError("hidden_state_dim must be >= 1")
         if self.hidden_state_action_dim < 1:
@@ -208,6 +222,10 @@ class MVT(nn.Module):
                     self.hidden_state_filter_init_log_measure_noise
                 ),
                 seed=self.hidden_state_filter_seed,
+                per_cell_alpha=self.hidden_state_filter_per_cell_alpha,
+                use_measure_adapter=self.hidden_state_filter_measure_adapter,
+                nonlinear_measure=self.hidden_state_filter_nonlinear_measure,
+                measure_rank=self.hidden_state_filter_measure_rank,
             )
 
         self.up0 = ConvexUpSample(

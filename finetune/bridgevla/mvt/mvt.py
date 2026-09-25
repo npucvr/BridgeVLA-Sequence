@@ -72,6 +72,10 @@ class MVT(nn.Module):
         hidden_state_filter_full_covariance=True,
         hidden_state_filter_seed=0,
         hidden_state_filter_init_log_measure_noise=48.0,
+        hidden_state_filter_per_cell_alpha=True,
+        hidden_state_filter_measure_adapter=True,
+        hidden_state_filter_nonlinear_measure=True,
+        hidden_state_filter_measure_rank=16,
     ):
         super().__init__()
 

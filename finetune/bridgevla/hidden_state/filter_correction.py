@@ -72,6 +72,8 @@ class MeasurementProjection(nn.Module):
         grid=4,
         measure_dim=64,
         seed=0,
+        use_measure_adapter=False,
+        measure_adapter_hidden=64,
     ):
         super().__init__()
         if int(token_dim) < 1:
@@ -120,6 +122,16 @@ class MeasurementProjection(nn.Module):
         # A buffer, never a parameter: frozen by construction.
         self.register_buffer("projection", projection)
 
+        # Optional residual on z = P(pool); zero-init so it starts as a no-op.
+        if use_measure_adapter:
+            self.measure_adapter = MeasurementAdapter(
+                token_dim=self.token_dim,
+                measure_dim=int(measure_dim),
+                hidden_dim=int(measure_adapter_hidden),
+            )
+        else:
+            self.measure_adapter = None
+
     def _cell_sums(self, tokens):
         """Return per-cell summed tokens with shape ``[B, V, G, G, D]``."""
         batch_size = tokens.shape[0]
@@ -155,11 +167,13 @@ class MeasurementProjection(nn.Module):
                 f"expected token dim {self.token_dim}, got {tokens.shape[-1]}"
             )
 
-        pooled = self._cell_sums(tokens.to(self.projection.dtype)).reshape(
-            -1, self.token_dim
-        )
-        projected = pooled @ self.projection
-        return projected.reshape(tokens.shape[0], self.measure_size)
+        pooled = self._cell_sums(tokens.to(self.projection.dtype))
+        projected = pooled.reshape(-1, self.token_dim) @ self.projection
+        measurement = projected.reshape(tokens.shape[0], self.measure_size)
+        if self.measure_adapter is not None:
+            pooled_cells = pooled.reshape(tokens.shape[0], self.num_cells, self.token_dim)
+            measurement = measurement + self.measure_adapter(pooled_cells)
+        return measurement
 
     def lift(self, delta_measurement):
         """Apply the adjoint ``P^T`` to a measurement-space correction.
@@ -205,6 +219,79 @@ class MeasurementProjection(nn.Module):
         )
 
 
+class MeasurementAdapter(nn.Module):
+    """Zero-init residual on the pooled measurement.
+
+    Adds a small learned term to ``z = P(H)`` without making ``P`` itself
+    trainable (which is degenerate with a free ``C_theta``). Each pooled cell
+    ``[D]`` is mapped to a residual in its own measurement slice
+    ``[measure_dim]``, so the stacked residual matches ``z``'s ``[B, m]``
+    layout. The last layer is zero-initialised so the measurement stays
+    exactly ``P(H)`` at the start.
+    """
+
+    def __init__(self, token_dim, measure_dim, hidden_dim=64):
+        super().__init__()
+        self.measure_dim = int(measure_dim)
+        self.net = nn.Sequential(
+            nn.Linear(token_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.measure_dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, pooled_tokens):
+        """Map ``[B, num_cells, D]`` pooled tokens to a residual ``[B, m]``."""
+        if pooled_tokens.ndim != 3:
+            raise ValueError(
+                "pooled_tokens must have shape [B, num_cells, D], got "
+                f"{tuple(pooled_tokens.shape)}"
+            )
+        batch_size, num_cells, width = pooled_tokens.shape
+        residual = self.net(pooled_tokens.reshape(batch_size * num_cells, width))
+        return residual.reshape(batch_size, num_cells * self.measure_dim)
+
+
+class NonlinearMeasurementResidual(nn.Module):
+    """Low-rank residual that turns linear ``C`` into ``C_theta(mu) = W mu + V sigma(U mu)``.
+
+    ``V`` is zero-initialised so ``C_theta`` starts as the linear map exactly.
+    The Jacobian is formed analytically as ``J = W + V diag(sigma'(U mu)) U``
+    and never via autograd over a full ``[B, m, d]`` map.
+    """
+
+    def __init__(self, hidden_dim, measure_size, rank=16):
+        super().__init__()
+        if int(rank) < 1:
+            raise ValueError(f"rank must be >= 1, got {rank}")
+        self.hidden_dim = int(hidden_dim)
+        self.measure_size = int(measure_size)
+        self.rank = int(rank)
+        self.up = nn.Parameter(
+            torch.randn(self.rank, self.hidden_dim) / math.sqrt(self.hidden_dim)
+        )
+        # Zero-init: residual is an exact no-op at the start of fine-tuning.
+        self.down = nn.Parameter(torch.zeros(self.measure_size, self.rank))
+
+    def forward(self, mean):
+        """Return ``V relu(U mu)`` with shape ``[B, m]``."""
+        pre = mean @ self.up.transpose(0, 1)  # [B, r]
+        return F.relu(pre) @ self.down.transpose(0, 1)
+
+    def jacobian(self, mean):
+        """Return ``V diag(relu'(U mu)) U`` with shape ``[B, m, d]``.
+
+        Built from the analytic low-rank factors (one batched einsum), not by
+        differentiating a full measurement map.
+        """
+        pre = mean @ self.up.transpose(0, 1)  # [B, r]
+        gate = (pre > 0).to(dtype=mean.dtype)  # relu'(pre)
+        return torch.einsum(
+            "mr,br,rd->bmd", self.down, gate, self.up
+        )
+
+
 class FilterCorrection(nn.Module):
     """Trainable Kalman filter model and the token residual it produces.
 
@@ -221,6 +308,13 @@ class FilterCorrection(nn.Module):
         init_log_measure_noise: Initial log diagonal measurement noise.
         init_state_log_scale: Initial log prior state standard deviation.
         seed: Seed for the frozen measurement projection.
+        per_cell_alpha: If ``True``, use one zero-init gate per spatial cell
+            instead of a single global scalar.
+        use_measure_adapter: If ``True``, add a zero-init residual adapter to
+            the measurement so ``z`` can specialise beyond the frozen ``P``.
+        nonlinear_measure: If ``True``, use ``C_theta(mu) = W mu + V relu(U mu)``
+            with a zero-init low-rank residual ``V`` and its analytic Jacobian.
+        measure_rank: Rank ``r`` of the nonlinear measurement residual.
 
     ``alpha`` is zero-initialised, so the corrected tokens equal the input
     tokens at the start of fine-tuning and the released BridgeVLA behaviour is
@@ -243,6 +337,10 @@ class FilterCorrection(nn.Module):
         init_log_measure_noise=48.0,
         init_state_log_scale=0.0,
         seed=0,
+        per_cell_alpha=True,
+        use_measure_adapter=True,
+        nonlinear_measure=True,
+        measure_rank=16,
     ):
         super().__init__()
         if int(hidden_state_dim) < 1:
@@ -254,6 +352,9 @@ class FilterCorrection(nn.Module):
         self.num_views = int(num_views)
         self.hidden_state_dim = int(hidden_state_dim)
         self.full_covariance = bool(full_covariance)
+        self.per_cell_alpha = bool(per_cell_alpha)
+        self.use_measure_adapter = bool(use_measure_adapter)
+        self.nonlinear_measure = bool(nonlinear_measure)
 
         self.measurement = MeasurementProjection(
             token_dim=self.token_dim,
@@ -262,8 +363,13 @@ class FilterCorrection(nn.Module):
             grid=int(grid),
             measure_dim=int(measure_dim),
             seed=seed,
+            use_measure_adapter=bool(use_measure_adapter),
+            measure_adapter_hidden=max(64, int(hidden_state_dim)),
         )
         self.measure_size = self.measurement.measure_size
+
+        # The residual adapter lives on MeasurementProjection so z = P(pool)
+        # + adapter(pool) stays in one place; expose it here for checkpoints.
 
         # Linear measurement model: z_hat = C_theta mu^-.
         self.measurement_matrix = nn.Linear(
@@ -273,6 +379,14 @@ class FilterCorrection(nn.Module):
             self.measurement_matrix.weight,
             std=1.0 / math.sqrt(self.hidden_state_dim),
         )
+        if self.nonlinear_measure:
+            self.measure_residual = NonlinearMeasurementResidual(
+                hidden_dim=self.hidden_state_dim,
+                measure_size=self.measure_size,
+                rank=int(measure_rank),
+            )
+        else:
+            self.measure_residual = None
 
         # Covariance prediction.  Identity keeps the prior covariance stable at
         # initialisation instead of contracting or exploding it.
@@ -288,7 +402,12 @@ class FilterCorrection(nn.Module):
         )
 
         # Zero-initialised residual gate: a strict no-op at the start.
-        self.alpha = nn.Parameter(torch.zeros(1))
+        # Per-cell gates let different spatial regions inject different
+        # correction magnitudes while staying inside the filter residual form.
+        if self.per_cell_alpha:
+            self.alpha = nn.Parameter(torch.zeros(self.measurement.num_cells))
+        else:
+            self.alpha = nn.Parameter(torch.zeros(1))
 
     # ------------------------------------------------------------------
     # filter model
@@ -296,6 +415,11 @@ class FilterCorrection(nn.Module):
     @property
     def measure_size_(self):
         return self.measure_size
+
+    @property
+    def measure_adapter(self):
+        """Residual measurement adapter (owned by ``measurement``)."""
+        return self.measurement.measure_adapter
 
     def process_noise(self):
         """Return the diagonal process noise ``diag(Q_theta)``, shape ``[d]``."""
@@ -389,6 +513,31 @@ class FilterCorrection(nn.Module):
         return diagonal * posterior_covariance + noise
 
     # ------------------------------------------------------------------
+    # measurement model C_theta
+    # ------------------------------------------------------------------
+    def measure_model(self, mean):
+        """Return ``C_theta(mu)`` with shape ``[B, m]``.
+
+        Linear: ``W mu``.  Nonlinear: ``W mu + V relu(U mu)`` (zero-init ``V``).
+        """
+        predicted = self.measurement_matrix(mean)
+        if self.measure_residual is not None:
+            predicted = predicted + self.measure_residual(mean)
+        return predicted
+
+    def measure_jacobian(self, mean):
+        """Return ``J = d C_theta / d mu`` at ``mean``, shape ``[B, m, d]``.
+
+        Analytic form only: ``J = W + V diag(relu'(U mu)) U`` when the residual
+        is enabled, else the constant ``W``.  Never built with autograd.
+        """
+        batch_size = mean.shape[0]
+        weight = self.measurement_matrix.weight  # [m, d]
+        if self.measure_residual is None:
+            return weight.unsqueeze(0).expand(batch_size, -1, -1)
+        return weight.unsqueeze(0) + self.measure_residual.jacobian(mean)
+
+    # ------------------------------------------------------------------
     # Kalman update in information form
     # ------------------------------------------------------------------
     def update(self, prior_mean, prior_covariance, measurement):
@@ -429,17 +578,21 @@ class FilterCorrection(nn.Module):
         device = self.measurement_matrix.weight.device
         prior_mean = prior_mean.to(dtype=dtype)
         measurement = measurement.to(dtype=dtype)
-        weight = self.measurement_matrix.weight  # C_theta, shape [m, d]
 
-        # Predicted measurement and innovation e_t = z_t - C mu^-.
-        innovation = measurement - self.measurement_matrix(prior_mean)
+        # EKF linearisation at mu^-: predicted measurement C_theta(mu^-) and
+        # Jacobian J = dC_theta/dmu (analytic; never an autograd [B, m, d]).
+        predicted_measurement = self.measure_model(prior_mean)
+        jacobian = self.measure_jacobian(prior_mean)  # [B, m, d]
+        innovation = measurement - predicted_measurement
 
         measure_noise = self.measure_noise().to(dtype)
         inverse_measure_noise = 1.0 / measure_noise
 
-        # Information matrix contribution C^T R^{-1} C, shape [d, d].
-        information = weight.transpose(0, 1) @ (
-            weight * inverse_measure_noise.unsqueeze(-1)
+        # Information matrix contribution J^T R^{-1} J, shape [B, d, d]
+        # (per-sample once the residual is active; broadcasts when linear).
+        weighted_jacobian = jacobian * inverse_measure_noise.unsqueeze(-1)
+        information = torch.matmul(
+            jacobian.transpose(1, 2), weighted_jacobian
         )
 
         jitter = _COVARIANCE_JITTER * torch.eye(
@@ -472,16 +625,21 @@ class FilterCorrection(nn.Module):
             # with the covariance actually used.
             log_posterior_information = torch.log(posterior_diagonal).sum(-1)
 
-        # Mean correction: mu^+ - mu^- = Sigma^+ C^T R^{-1} e.
+        # Mean correction: mu^+ - mu^- = Sigma^+ J^T R^{-1} e.
         weighted_innovation = inverse_measure_noise * innovation  # R^{-1} e
-        projected = weighted_innovation @ weight  # C^T R^{-1} e
+        projected = torch.matmul(
+            jacobian.transpose(1, 2), weighted_innovation.unsqueeze(-1)
+        ).squeeze(-1)  # J^T R^{-1} e
         mean_correction = torch.einsum(
             "bij,bj->bi", posterior_covariance, projected
         )
         posterior_mean = prior_mean + mean_correction
 
-        # Measurement-space correction Delta z_t = C (mu^+ - mu^-).
-        delta_measurement = self.measurement_matrix(mean_correction)
+        # Measurement-space correction Delta z_t = J (mu^+ - mu^-).
+        # Equals C (mu^+ - mu^-) when the residual is inactive.
+        delta_measurement = torch.matmul(
+            jacobian, mean_correction.unsqueeze(-1)
+        ).squeeze(-1)
 
         # Innovation likelihood without forming S.
         quadratic = (inverse_measure_noise * innovation.square()).sum(-1)
@@ -512,6 +670,13 @@ class FilterCorrection(nn.Module):
     # ------------------------------------------------------------------
     # token correction
     # ------------------------------------------------------------------
+    def _gate(self, dtype, device):
+        """Return injection gates broadcastable to ``[B, num_cells, D_z]``."""
+        gate = self.alpha.to(dtype=dtype, device=device)
+        if self.per_cell_alpha:
+            return gate.view(1, self.measurement.num_cells, 1)
+        return gate.view(1, 1, 1)
+
     def correct_tokens(self, tokens, delta_measurement):
         """Add ``alpha * B Delta z_t`` to the tokens.
 
@@ -522,9 +687,18 @@ class FilterCorrection(nn.Module):
         """
         if not isinstance(tokens, torch.Tensor) or tokens.ndim != 3:
             raise ValueError("tokens must be a tensor with shape [B, V*S, D]")
-        delta_tokens = self.measurement.lift(delta_measurement)
+        delta = delta_measurement
+        if self.per_cell_alpha:
+            delta = delta.reshape(
+                delta.shape[0], self.measurement.num_cells, self.measurement.measure_dim
+            )
+            delta = delta * self._gate(delta.dtype, delta.device)
+            delta = delta.reshape(delta.shape[0], self.measure_size)
+        else:
+            delta = delta * self.alpha.to(dtype=delta.dtype, device=delta.device)
+        delta_tokens = self.measurement.lift(delta)
         tokens = tokens.to(dtype=delta_tokens.dtype)
-        return tokens + self.alpha.to(tokens.dtype) * delta_tokens
+        return tokens + delta_tokens
 
     def forward(self, tokens, prior_mean, prior_covariance):
         """Measure, filter, and correct the current visual tokens.
@@ -552,8 +726,22 @@ class FilterCorrection(nn.Module):
         trace (the gain becomes a constant), and a runaway measurement noise
         (the filter stops trusting any observation).
         """
-        delta_tokens = self.measurement.lift(filtered["delta_measurement"])
-        applied = self.alpha.detach().abs() * delta_tokens.norm()
+        if self.per_cell_alpha:
+            delta = filtered["delta_measurement"].reshape(
+                filtered["delta_measurement"].shape[0],
+                self.measurement.num_cells,
+                self.measurement.measure_dim,
+            )
+            gated = delta * self._gate(delta.dtype, delta.device).reshape(
+                1, self.measurement.num_cells, 1
+            )
+            gated = gated.reshape(filtered["delta_measurement"].shape[0], -1)
+        else:
+            gated = filtered["delta_measurement"] * self.alpha.to(
+                filtered["delta_measurement"].dtype
+            )
+        delta_tokens = self.measurement.lift(gated)
+        applied = delta_tokens.norm()
         covariance = filtered["posterior_covariance"]
         if self.full_covariance:
             posterior_trace = covariance.diagonal(dim1=-2, dim2=-1).sum(-1)

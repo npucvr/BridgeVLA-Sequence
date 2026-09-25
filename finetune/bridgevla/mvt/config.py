@@ -45,6 +45,11 @@ _C.hidden_state_filter_grid = 4
 _C.hidden_state_filter_full_covariance = True
 _C.hidden_state_filter_seed = 0
 _C.hidden_state_filter_init_log_measure_noise = 48.0
+# Capacity expansions of the filter route. Both are zero-init no-ops at start.
+_C.hidden_state_filter_per_cell_alpha = True
+_C.hidden_state_filter_measure_adapter = True
+_C.hidden_state_filter_nonlinear_measure = True
+_C.hidden_state_filter_measure_rank = 16
 
 
 def get_cfg_defaults():
