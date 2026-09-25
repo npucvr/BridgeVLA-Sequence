@@ -60,6 +60,7 @@ class MVT(nn.Module):
         st_wpt_loc_inp_no_noise,
         img_aug_2,
         renderer_device,
+        continuous_rotation=False,
         load_pretrain=False,
         pretrain_path=None,
         paligemma_path="",
@@ -95,6 +96,12 @@ class MVT(nn.Module):
 
         self.rot_ver = rot_ver
         self.num_rot = num_rot
+        self.continuous_rotation = bool(continuous_rotation)
+        if self.continuous_rotation and self.rot_ver != 1:
+            raise ValueError(
+                "continuous_rotation requires rot_ver=1 so that the 6D "
+                "head replaces the discrete per-axis rotation path"
+            )
         self.stage_two = stage_two
         self.st_sca = st_sca
         self.st_wpt_loc_aug = st_wpt_loc_aug
@@ -292,13 +299,20 @@ class MVT(nn.Module):
                 or (not wpt_local is None)
             )
 
-            if self.rot_ver == 0:
+            if self.rot_ver in (0, 2):
+                # rot_ver==2 (6D regression) has no autoregressive rot_x_y
+                # conditioning (that is rot_ver==1 only).
                 assert rot_x_y is None, f"rot_x_y={rot_x_y}"
-            elif self.rot_ver == 1:
+            elif self.rot_ver == 1 and not self.continuous_rotation:
                 assert rot_x_y.shape == (bs, 2), f"rot_x_y.shape={rot_x_y.shape}"
                 assert (rot_x_y >= 0).all() and (
                     rot_x_y < self.num_rot
                 ).all(), f"rot_x_y={rot_x_y}"
+            elif self.rot_ver == 1 and self.continuous_rotation:
+                assert rot_x_y is None, (
+                    "continuous_rotation does not consume teacher-forced "
+                    f"Euler bins, got rot_x_y={rot_x_y}"
+                )
             else:
                 assert False
 

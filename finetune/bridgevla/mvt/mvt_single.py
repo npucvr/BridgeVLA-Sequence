@@ -64,6 +64,7 @@ class MVT(nn.Module):
         num_rot,
         renderer_device="cuda:0",
         renderer=None,
+        continuous_rotation=False,
         no_feat=False,
         load_pretrain=False,
         pretrain_path=None,
@@ -104,6 +105,7 @@ class MVT(nn.Module):
         self.use_point_renderer = use_point_renderer
         self.rot_ver = rot_ver
         self.num_rot = num_rot
+        self.continuous_rotation = bool(continuous_rotation)
         self.no_feat = no_feat
 
         if self.cvx_up:
@@ -266,26 +268,47 @@ class MVT(nn.Module):
 
             feat_out_size = feat_dim
 
-            if self.rot_ver == 0:
+            if self.rot_ver in (0, 2):
+                # rot_ver == 0: discrete Euler logits + grip/coll.
+                # rot_ver == 2 (BridgeVLA++ 6D): same feat_fc MLP with
+                # feat_dim=10 (6D rot + grip(2) + collision(2)).
                 self.feat_fc = get_feat_fc(
                     self.num_img * feat_fc_dim,
                     feat_out_size,
                 )
             elif self.rot_ver == 1:
-                assert self.num_rot * 3 <= feat_out_size
-                feat_out_size_ex_rot = feat_out_size - (self.num_rot * 3)
+                if self.continuous_rotation:
+                    # ``feat_dim`` is the legacy packed output width
+                    # (216 rotation logits + 4 grip/collision logits).  The
+                    # continuous head is a replacement, so the auxiliary
+                    # output stays at four dimensions for checkpoint
+                    # compatibility instead of becoming 220 - 6.
+                    feat_out_size_ex_rot = 4
+                else:
+                    rotation_output_dim = self.num_rot * 3
+                    if rotation_output_dim > feat_out_size:
+                        raise ValueError(
+                            "feat_dim is too small for the configured rotation "
+                            f"path: feat_dim={feat_out_size}, required={rotation_output_dim}"
+                        )
+                    feat_out_size_ex_rot = feat_out_size - rotation_output_dim
                 if feat_out_size_ex_rot > 0:
                     self.feat_fc_ex_rot = get_feat_fc(
                         self.num_img * feat_fc_dim, feat_out_size_ex_rot
                     )
 
                 self.feat_fc_init_bn = nn.BatchNorm1d(self.num_img * feat_fc_dim)
-                self.feat_fc_pe = FixedPositionalEncoding(
-                    self.num_img * feat_fc_dim, feat_scale_factor=1
-                )
-                self.feat_fc_x = get_feat_fc(self.num_img * feat_fc_dim, self.num_rot)
-                self.feat_fc_y = get_feat_fc(self.num_img * feat_fc_dim, self.num_rot)
-                self.feat_fc_z = get_feat_fc(self.num_img * feat_fc_dim, self.num_rot)
+                if self.continuous_rotation:
+                    self.feat_fc_rot6d = get_feat_fc(
+                        self.num_img * feat_fc_dim, 6
+                    )
+                else:
+                    self.feat_fc_pe = FixedPositionalEncoding(
+                        self.num_img * feat_fc_dim, feat_scale_factor=1
+                    )
+                    self.feat_fc_x = get_feat_fc(self.num_img * feat_fc_dim, self.num_rot)
+                    self.feat_fc_y = get_feat_fc(self.num_img * feat_fc_dim, self.num_rot)
+                    self.feat_fc_z = get_feat_fc(self.num_img * feat_fc_dim, self.num_rot)
 
             else:
                 assert False
@@ -591,9 +614,21 @@ class MVT(nn.Module):
             feat.append(_feat)
             feat = torch.cat(feat, dim=-1)
 
-            if self.rot_ver == 0:
+            if self.rot_ver in (0, 2):
+                # rot_ver==2 (6D regression) shares the single feat_fc path;
+                # the agent reads feat[:, :6] as the 6D rotation.
                 feat = self.feat_fc(feat)
                 out = {"feat": feat}
+            elif self.rot_ver == 1 and self.continuous_rotation:
+                # The continuous path predicts two orthogonalized rotation
+                # columns directly; no teacher-forced Euler bins are needed.
+                feat_ex_rot = self.feat_fc_ex_rot(feat)
+                feat_rot = self.feat_fc_init_bn(feat)
+                feat_rot6d = self.feat_fc_rot6d(feat_rot)
+                out = {
+                    "feat_ex_rot": feat_ex_rot,
+                    "feat_rot6d": feat_rot6d,
+                }
             elif self.rot_ver == 1:
                 # features except rotation
                 feat_ex_rot = self.feat_fc_ex_rot(feat)

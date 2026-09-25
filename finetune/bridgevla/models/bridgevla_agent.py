@@ -21,6 +21,7 @@ import pprint
 import torch
 import numpy as np
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy.spatial.transform import Rotation
 from torch.nn.parallel.distributed import DistributedDataParallel
 import sys
@@ -31,6 +32,10 @@ import GemBench.utils.peract_utils_gembench as gembench_utils
 import bridgevla.mvt.utils as mvt_utils
 import bridgevla.utils.rvt_utils as rvt_utils
 from bridgevla.mvt.augmentation import apply_se3_aug_con, aug_utils
+from bridgevla.mvt.rotation import (
+    ortho6d_to_quaternion_xyzw,
+    quaternion_xyzw_to_ortho6d,
+)
 from yarr.agents.agent import ActResult
 from PIL import Image, ImageDraw
 import torch
@@ -416,6 +421,7 @@ class RVTAgent:
         rot_x_y_aug: int = 2,
         log_dir="",
         hidden_state_route_only=False,
+        hidden_state_unfreeze_action_path=False,
         hidden_state_filter_innovation_loss_weight: float = 0.0,
     ):
         self._network = network
@@ -442,6 +448,9 @@ class RVTAgent:
         self.scene_bounds = scene_bounds
         self.cameras = cameras
         self._hidden_state_route_only = hidden_state_route_only
+        self._hidden_state_unfreeze_action_path = bool(
+            hidden_state_unfreeze_action_path
+        )
         self._hidden_state_filter_innovation_loss_weight = float(
             hidden_state_filter_innovation_loss_weight
         )
@@ -492,8 +501,18 @@ class RVTAgent:
             )
         self._hidden_state_y = None
         self._pending_action = None
-
-        self.num_all_rot = self._num_rotation_classes * 3
+        self.continuous_rotation = bool(
+            getattr(self._net_mod.mvt1, "continuous_rotation", False)
+        )
+        if self.continuous_rotation and self.rot_ver != 1:
+            raise ValueError(
+                "continuous_rotation requires RVTAgent rot_ver=1"
+            )
+        # BridgeVLA++ continuous 6D regression (rot_ver == 2): the feat
+        # vector's rotation slice is a 6D vector rather than discrete Euler
+        # logits. Loss is Frobenius^2 on SO(3) after Gram-Schmidt.
+        self.rot_6d = self.rot_ver == 2
+        self.num_all_rot = 6 if self.rot_6d else self._num_rotation_classes * 3
 
     def build(self, training: bool, device: torch.device = None):
         self._training = training
@@ -541,13 +560,17 @@ class RVTAgent:
 
         # fill one-hots
         for b in range(bs):
-            gt_rot = action_rot[b]
-            gt_rot = aug_utils.quaternion_to_discrete_euler(
-                gt_rot, self._rotation_resolution
-            )
-            action_rot_x_one_hot[b, gt_rot[0]] = 1
-            action_rot_y_one_hot[b, gt_rot[1]] = 1
-            action_rot_z_one_hot[b, gt_rot[2]] = 1
+            # 6D regression head (rot_ver==2): rotation is not discretized,
+            # the rot one-hots stay zero, and the 6D loss reads the GT
+            # quaternion -> rotation matrix directly via _gt_rotmat_from_quat.
+            if not self.rot_6d:
+                gt_rot = action_rot[b]
+                gt_rot = aug_utils.quaternion_to_discrete_euler(
+                    gt_rot, self._rotation_resolution
+                )
+                action_rot_x_one_hot[b, gt_rot[0]] = 1
+                action_rot_y_one_hot[b, gt_rot[1]] = 1
+                action_rot_z_one_hot[b, gt_rot[2]] = 1
 
             # grip
             gt_grip = action_grip[b]
@@ -564,6 +587,18 @@ class RVTAgent:
             action_grip_one_hot,
             action_collision_one_hot,
         )
+
+    def _gt_rotmat_from_quat(self, action_rot, device):
+        """(bs, 4) quaternion xyzw -> (bs, 3, 3) torch rotation matrix.
+
+        GT target for the 6D regression head (rot_ver==2). No discretization /
+        gimble_fix / hemisphere handling: R and the antipodal quaternion -q
+        yield the same R, so the 6D target is sign-invariant by construction.
+        """
+        if isinstance(action_rot, torch.Tensor):
+            action_rot = action_rot.detach().cpu().numpy()
+        R = aug_utils.quaternion_xyzw_to_matrix_np(action_rot)
+        return torch.from_numpy(np.asarray(R)).float().to(device)
 
 
     def get_q(self, out, dims, only_pred=False, get_q_trans=True):
@@ -598,8 +633,9 @@ class RVTAgent:
             if self.stage_two:
                 out = out["mvt2"]
 
-        if self.rot_ver == 0:
-            # (bs, 218)
+        if self.rot_ver in (0, 2):
+            # rot_q is discrete logits (rot_ver==0) or the 6D vector
+            # (rot_ver==2); layout is [rot | grip(2) | collision(2)].
             rot_q = out["feat"].view(bs, -1)[:, 0 : self.num_all_rot]
             grip_q = out["feat"].view(bs, -1)[:, self.num_all_rot : self.num_all_rot + 2]
             # (bs, 2)
@@ -607,8 +643,11 @@ class RVTAgent:
                 :, self.num_all_rot + 2 : self.num_all_rot + 4
             ]
         elif self.rot_ver == 1:
-            rot_q = torch.cat((out["feat_x"], out["feat_y"], out["feat_z"]),
-                              dim=-1).view(bs, -1)
+            if self.continuous_rotation:
+                rot_q = out["feat_rot6d"].view(bs, 6)
+            else:
+                rot_q = torch.cat((out["feat_x"], out["feat_y"], out["feat_z"]),
+                                  dim=-1).view(bs, -1)
             grip_q = out["feat_ex_rot"].view(bs, -1)[:, :2]
             collision_q = out["feat_ex_rot"].view(bs, -1)[:, 2:]
         else:
@@ -783,7 +822,17 @@ class RVTAgent:
             bs, action_rot, action_grip, action_ignore_collisions, device=self._device
         )
 
-        if self.rot_ver == 1:
+        action_rot_6d = None
+        if self.continuous_rotation:
+            action_rot_6d = quaternion_xyzw_to_ortho6d(
+                torch.as_tensor(
+                    action_rot,
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+            )
+
+        if self.rot_ver == 1 and not self.continuous_rotation:
             rot_x_y = torch.cat(
                 [
                     action_rot_x_one_hot.argmax(dim=-1, keepdim=True),
@@ -822,7 +871,11 @@ class RVTAgent:
             lang_emb=None,
             img_aug=img_aug,
             wpt_local=wpt_local if self._network.training else None,
-            rot_x_y=rot_x_y if self.rot_ver == 1 else None,
+            rot_x_y=(
+                rot_x_y
+                if self.rot_ver == 1 and not self.continuous_rotation
+                else None
+            ),
             language_goal=replay_sample["lang_goal"],
             **hidden_state_kwargs,
         )
@@ -846,6 +899,7 @@ class RVTAgent:
             # applied without changing the legacy single-step objective.
             zero_loss = trans_loss.new_zeros(())
             rot_loss_x = rot_loss_y = rot_loss_z = zero_loss
+            rot_loss_6d = zero_loss
             grip_loss = zero_loss
             collision_loss = zero_loss
             # Filter route: the auxiliary objective is the innovation negative
@@ -862,35 +916,52 @@ class RVTAgent:
                     )
                 filter_innovation_loss = reduce_loss(innovation_nll)
             if self.add_rgc_loss:
-                rot_loss_x = reduce_loss(
-                    self._cross_entropy_loss(
-                        rot_q[
-                            :,
-                            0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
-                        ],
-                        action_rot_x_one_hot.argmax(-1),
+                if self.rot_6d:
+                    # 6D regression (BridgeVLA++): Frobenius^2 to GT rotation matrix.
+                    R_pred = aug_utils.rotation_6d_to_matrix(rot_q)
+                    R_gt = self._gt_rotmat_from_quat(action_rot, rot_q.device)
+                    rot_loss_6d = ((R_pred - R_gt) ** 2).sum(dim=(-1, -2)).mean()
+                elif self.continuous_rotation:
+                    # Mean over the 6 ortho6d entries keeps this term on a
+                    # comparable scale to the per-class CE terms instead of
+                    # summing six residual elements into the action loss.
+                    rot_loss_6d = reduce_loss(
+                        F.smooth_l1_loss(
+                            rot_q,
+                            action_rot_6d,
+                            reduction="none",
+                        ).mean(dim=-1)
                     )
-                )
+                else:
+                    rot_loss_x = reduce_loss(
+                        self._cross_entropy_loss(
+                            rot_q[
+                                :,
+                                0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
+                            ],
+                            action_rot_x_one_hot.argmax(-1),
+                        )
+                    )
 
-                rot_loss_y = reduce_loss(
-                    self._cross_entropy_loss(
-                        rot_q[
-                            :,
-                            1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
-                        ],
-                        action_rot_y_one_hot.argmax(-1),
+                    rot_loss_y = reduce_loss(
+                        self._cross_entropy_loss(
+                            rot_q[
+                                :,
+                                1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
+                            ],
+                            action_rot_y_one_hot.argmax(-1),
+                        )
                     )
-                )
 
-                rot_loss_z = reduce_loss(
-                    self._cross_entropy_loss(
-                        rot_q[
-                            :,
-                            2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
-                        ],
-                        action_rot_z_one_hot.argmax(-1),
+                    rot_loss_z = reduce_loss(
+                        self._cross_entropy_loss(
+                            rot_q[
+                                :,
+                                2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
+                            ],
+                            action_rot_z_one_hot.argmax(-1),
+                        )
                     )
-                )
 
                 grip_loss = reduce_loss(
                     self._cross_entropy_loss(
@@ -907,6 +978,7 @@ class RVTAgent:
 
             action_loss = (
                 trans_loss
+                + rot_loss_6d
                 + rot_loss_x
                 + rot_loss_y
                 + rot_loss_z
@@ -930,6 +1002,7 @@ class RVTAgent:
                 "rot_loss_x": rot_loss_x.item(),
                 "rot_loss_y": rot_loss_y.item(),
                 "rot_loss_z": rot_loss_z.item(),
+                "rot_loss_6d": rot_loss_6d.item(),
                 "grip_loss": grip_loss.item(),
                 "collision_loss": collision_loss.item(),
                 "filter_innovation_loss": filter_innovation_loss.item(),
@@ -1192,6 +1265,7 @@ class RVTAgent:
                         "rot_loss_x",
                         "rot_loss_y",
                         "rot_loss_z",
+                        "rot_loss_6d",
                         "grip_loss",
                         "collision_loss",
                          "filter_innovation_loss",
@@ -1371,7 +1445,17 @@ class RVTAgent:
             bs, action_rot, action_grip, action_ignore_collisions, device=self._device
         )
 
-        if self.rot_ver == 1:
+        action_rot_6d = None
+        if self.continuous_rotation:
+            action_rot_6d = quaternion_xyzw_to_ortho6d(
+                torch.as_tensor(
+                    action_rot,
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+            )
+
+        if self.rot_ver == 1 and not self.continuous_rotation:
             rot_x_y = torch.cat(
                 [
                     action_rot_x_one_hot.argmax(dim=-1, keepdim=True),
@@ -1410,7 +1494,11 @@ class RVTAgent:
             lang_emb=None,
             img_aug=img_aug,
             wpt_local=wpt_local if self._network.training else None,
-            rot_x_y=rot_x_y if self.rot_ver == 1 else None,
+            rot_x_y=(
+                rot_x_y
+                if self.rot_ver == 1 and not self.continuous_rotation
+                else None
+            ),
             language_goal=replay_sample["lang_goal"],
             **hidden_state_kwargs,
         )
@@ -1428,33 +1516,46 @@ class RVTAgent:
             trans_loss = self._cross_entropy_loss(q_trans, action_trans).mean()  
             zero_loss = trans_loss.new_zeros(())
             rot_loss_x = rot_loss_y = rot_loss_z = zero_loss
+            rot_loss_6d = zero_loss
             grip_loss = zero_loss
             collision_loss = zero_loss
             if self.add_rgc_loss:
-                
-                rot_loss_x = self._cross_entropy_loss(
-                    rot_q[
-                        :,
-                        0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
-                    ],
-                    action_rot_x_one_hot.argmax(-1),
-                ).mean()
+                if self.rot_6d:
+                    # BridgeVLA++ 6D regression: Gram-Schmidt -> R_pred vs R_gt,
+                    # Frobenius^2 — a stable monotone surrogate on SO(3).
+                    R_pred = aug_utils.rotation_6d_to_matrix(rot_q)
+                    R_gt = self._gt_rotmat_from_quat(action_rot, rot_q.device)
+                    rot_loss_6d = ((R_pred - R_gt) ** 2).sum(dim=(-1, -2)).mean()
+                elif self.continuous_rotation:
+                    rot_loss_6d = F.smooth_l1_loss(
+                        rot_q,
+                        action_rot_6d,
+                        reduction="none",
+                    ).mean()
+                else:
+                    rot_loss_x = self._cross_entropy_loss(
+                        rot_q[
+                            :,
+                            0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
+                        ],
+                        action_rot_x_one_hot.argmax(-1),
+                    ).mean()
 
-                rot_loss_y = self._cross_entropy_loss(
-                    rot_q[
-                        :,
-                        1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
-                    ],
-                    action_rot_y_one_hot.argmax(-1),
-                ).mean()
+                    rot_loss_y = self._cross_entropy_loss(
+                        rot_q[
+                            :,
+                            1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
+                        ],
+                        action_rot_y_one_hot.argmax(-1),
+                    ).mean()
 
-                rot_loss_z = self._cross_entropy_loss(
-                    rot_q[
-                        :,
-                        2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
-                    ],
-                    action_rot_z_one_hot.argmax(-1),
-                ).mean()
+                    rot_loss_z = self._cross_entropy_loss(
+                        rot_q[
+                            :,
+                            2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
+                        ],
+                        action_rot_z_one_hot.argmax(-1),
+                    ).mean()
                 
                 grip_loss = self._cross_entropy_loss(
                     grip_q,
@@ -1467,6 +1568,7 @@ class RVTAgent:
 
             total_loss = (
                 trans_loss
+                + rot_loss_6d
                 + rot_loss_x
                 + rot_loss_y
                 + rot_loss_z
@@ -1484,6 +1586,7 @@ class RVTAgent:
                 "rot_loss_x": rot_loss_x.item(),
                 "rot_loss_y": rot_loss_y.item(),
                 "rot_loss_z": rot_loss_z.item(),
+                "rot_loss_6d": rot_loss_6d.item(),
                 "grip_loss": grip_loss.item(),
                 "collision_loss": collision_loss.item(),
                 "lr": self._optimizer.param_groups[0]["lr"],
@@ -1669,26 +1772,36 @@ class RVTAgent:
             pred_wpt.append(_rev_trans(_pred_wpt_local))
         pred_wpt = torch.cat([x.unsqueeze(0) for x in pred_wpt])
 
-        pred_rot = torch.cat(
-            (
-                rot_q[
-                    :,
-                    0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
-                ].argmax(1, keepdim=True),
-                rot_q[
-                    :,
-                    1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
-                ].argmax(1, keepdim=True),
-                rot_q[
-                    :,
-                    2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
-                ].argmax(1, keepdim=True),
-            ),
-            dim=-1,
-        )
-        pred_rot_quat = aug_utils.discrete_euler_to_quaternion(
-            pred_rot.cpu(), self._rotation_resolution
-        )
+        if self.rot_6d or self.continuous_rotation:
+            # 6D regression: Gram-Schmidt -> R -> quat xyzw, matching the
+            # discrete head's (bs, 4) numpy contract. Prefer the BridgeVLA++
+            # helper so rot_ver==2 and the legacy continuous path share one
+            # decode.
+            R_pred = aug_utils.rotation_6d_to_matrix(rot_q)
+            pred_rot_quat = aug_utils.matrix_to_quaternion_xyzw_np(
+                R_pred.detach().cpu().numpy()
+            )
+        else:
+            pred_rot = torch.cat(
+                (
+                    rot_q[
+                        :,
+                        0 * self._num_rotation_classes : 1 * self._num_rotation_classes,
+                    ].argmax(1, keepdim=True),
+                    rot_q[
+                        :,
+                        1 * self._num_rotation_classes : 2 * self._num_rotation_classes,
+                    ].argmax(1, keepdim=True),
+                    rot_q[
+                        :,
+                        2 * self._num_rotation_classes : 3 * self._num_rotation_classes,
+                    ].argmax(1, keepdim=True),
+                ),
+                dim=-1,
+            )
+            pred_rot_quat = aug_utils.discrete_euler_to_quaternion(
+                pred_rot.cpu(), self._rotation_resolution
+            )
         pred_grip = grip_q.argmax(1, keepdim=True)
         pred_coll = collision_q.argmax(1, keepdim=True)
 
@@ -1750,12 +1863,14 @@ class RVTAgent:
     def train(self):
         self._network.train()
         if self._hidden_state_route_only:
-            # Only the route's own modules stay in training mode; the frozen
-            # BridgeVLA stack is kept in eval so its BatchNorm statistics do not
-            # drift between timesteps.
-            trainable_hidden_modules = {"F_phi", "filter_correction"}
-            for name, module in self._net_mod.mvt1.named_children():
-                if name not in trainable_hidden_modules:
+            # Only modules with requires_grad=True stay in training mode; the
+            # frozen BridgeVLA stack is kept in eval so its BatchNorm statistics
+            # do not drift between timesteps. Action-path modules that were
+            # deliberately unfrozen (6D head, BN, convex-upsample outputs) must
+            # remain in train mode or they never learn.
+            for module in self._net_mod.modules():
+                if not any(p.requires_grad for p in module.parameters(recurse=False)):
                     module.eval()
-            for name in trainable_hidden_modules:
-                getattr(self._net_mod.mvt1, name).train()
+            for module in self._net_mod.modules():
+                if any(p.requires_grad for p in module.parameters(recurse=False)):
+                    module.train()

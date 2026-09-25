@@ -84,6 +84,51 @@ def discrete_euler_to_quaternion(discrete_euler, resolution):
     return Rotation.from_euler("xyz", euluer, degrees=True).as_quat()
 
 
+# 6D continuous rotation representation (Zhou et al., CVPR 2019,
+# "On the Continuity of Rotation Representations in Neural Networks").
+# Ported from BridgeVLA++ (main) for rot_ver == 2. These ops are pure-torch
+# and differentiable so ``rotation_6d_to_matrix`` can sit inside the training
+# loss. Convention: the 6D vector packs the first two COLUMNS of the rotation
+# matrix; Gram-Schmidt recovers an orthonormal R in SO(3). There is NO
+# discretization, NO gimble_fix, and NO quaternion double-cover handling
+# (q and -q map to the same R, so the sign is irrelevant here).
+
+
+def rotation_6d_to_matrix(d6):
+    """(..., 6) -> (..., 3, 3) rotation matrix via Gram-Schmidt.
+
+    a1 = d6[..., 0:3], a2 = d6[..., 3:6] are the (unconstrained) first two
+    columns. b1 = normalize(a1); b2 = normalize(a2 - <b1,a2> b1);
+    b3 = b1 x b2. The three orthonormal vectors are stacked as COLUMNS.
+    """
+    a1 = d6[..., 0:3]
+    a2 = d6[..., 3:6]
+    b1 = torch.nn.functional.normalize(a1, dim=-1)
+    a2 = a2 - (b1 * a2).sum(dim=-1, keepdim=True) * b1
+    b2 = torch.nn.functional.normalize(a2, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack((b1, b2, b3), dim=-1)
+
+
+def matrix_to_rotation_6d(matrix):
+    """(..., 3, 3) -> (..., 6): the first two COLUMNS flattened.
+
+    Inverse companion of :func:`rotation_6d_to_matrix` (up to the
+    Gram-Schmidt projection, which is the identity for a valid R).
+    """
+    return torch.cat((matrix[..., 0], matrix[..., 1]), dim=-1)
+
+
+def quaternion_xyzw_to_matrix_np(quat_xyzw):
+    """(..., 4) numpy quaternion (xyzw) -> (..., 3, 3) numpy rotation matrix."""
+    return Rotation.from_quat(np.asarray(quat_xyzw)).as_matrix()
+
+
+def matrix_to_quaternion_xyzw_np(matrix):
+    """(..., 3, 3) numpy rotation matrix -> (..., 4) numpy quaternion (xyzw)."""
+    return Rotation.from_matrix(np.asarray(matrix)).as_quat()
+
+
 def point_to_voxel_index(
     point: np.ndarray, voxel_size: np.ndarray, coord_bounds: np.ndarray
 ):

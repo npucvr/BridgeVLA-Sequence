@@ -1,0 +1,21 @@
+# BridgeVLA RLBench action decoder with BridgeVLA++ continuous 6D rotation
+# (rot_ver=2, Zhou et al. CVPR 2019): one feat_fc emits [6D rot | grip(2) |
+# coll(2)], Gram-Schmidt -> SO(3), Frobenius^2 loss to the GT matrix.
+# Hidden-state filter options remain explicit run-time overrides so this file
+# also stays usable for a non-filter continuous-rotation ablation.
+stage_two: True
+norm_corr: True
+rend_three_views: True
+use_point_renderer: True
+inp_pre_pro: False
+inp_pre_con: False
+feat_ver: 1
+img_size: 224
+img_patch_size: 14
+cvx_up: True
+xops: True
+rot_ver: 2
+num_rot: 72
+st_wpt_loc_inp_no_noise: True
+wpt_img_aug: 0.0
+img_aug_2: 0.05

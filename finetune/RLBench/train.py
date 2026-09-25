@@ -17,6 +17,7 @@ Author: Peiyan Li
 Email: peiyan.li@cripac.ia.ac.cn
 '''
 import os
+import random
 import subprocess
 import time
 import tqdm
@@ -25,6 +26,7 @@ import argparse
 import time
 from collections import defaultdict
 from contextlib import redirect_stdout
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -35,6 +37,10 @@ import bridgevla.models.bridgevla_agent as bridgevla_agent
 import bridgevla.mvt.config as mvt_cfg_mod
 
 from bridgevla.mvt.mvt import MVT
+from bridgevla.mvt.lora import (
+    inject_discrete_action_lora,
+    merged_lora_state_dict,
+)
 from utils.get_dataset import get_dataset
 from bridgevla.utils.rvt_utils import (
     get_num_feat,
@@ -106,9 +112,12 @@ def save_agent(agent, path, epoch):
     model = agent._network
 
     if isinstance(model, DDP):
-        model_state = model.module.state_dict()
+        model = model.module
     else:
-        model_state = model.state_dict()
+        model = model
+    # LoRA is a training-time parameterization. Export a standard BridgeVLA
+    # checkpoint by merging its deltas into the original action-head weights.
+    model_state = merged_lora_state_dict(model)
 
     torch.save(
         {
@@ -176,6 +185,7 @@ def load_initial_checkpoint(backbone, checkpoint_path):
         checkpoint_path, map_location="cpu", weights_only=True
     )
     state = checkpoint.get("model_state", checkpoint)
+    source_state = dict(state)
     legacy_hidden_route_prefixes = (
         "mvt1.A_psi.",
         "mvt1.U_omega.",
@@ -211,15 +221,55 @@ def load_initial_checkpoint(backbone, checkpoint_path):
             for key, value in state.items()
             if not key.startswith(legacy_hidden_route_prefixes)
         }
+    continuous_rotation = bool(
+        getattr(backbone.mvt1, "continuous_rotation", False)
+    )
+    rot_ver = int(getattr(backbone.mvt1, "rot_ver", 0))
+    rot_6d = rot_ver == 2
+    if continuous_rotation:
+        # The new 6D head intentionally replaces the three 72-way Euler
+        # heads.  Keep the shared backbone/action features from an old filter
+        # checkpoint while allowing the replacement head to initialize fresh.
+        legacy_rotation_prefixes = (
+            "mvt1.feat_fc_pe.",
+            "mvt1.feat_fc_x.",
+            "mvt1.feat_fc_y.",
+            "mvt1.feat_fc_z.",
+        )
+        state = {
+            key: value
+            for key, value in state.items()
+            if not key.startswith(legacy_rotation_prefixes)
+        }
+    if rot_6d:
+        # BridgeVLA++ rot_ver=2 replaces the discrete rot/grip/coll heads with
+        # one feat_fc (feat_dim=10). Drop the legacy heads (including BN) so
+        # load_state_dict does not see them as unexpected.
+        legacy_rotation_prefixes = (
+            "mvt1.feat_fc_pe.",
+            "mvt1.feat_fc_x.",
+            "mvt1.feat_fc_y.",
+            "mvt1.feat_fc_z.",
+            "mvt1.feat_fc_ex_rot.",
+            "mvt1.feat_fc_init_bn.",
+        )
+        state = {
+            key: value
+            for key, value in state.items()
+            if not key.startswith(legacy_rotation_prefixes)
+        }
     missing, unexpected = backbone.load_state_dict(state, strict=False)
     unexpected = list(unexpected)
-    if not backbone.mvt1.hidden_state_enabled:
-        allowed_missing_prefixes = ()
-    else:
-        allowed_missing_prefixes = (
-            "mvt1.F_phi.",
-            "mvt1.filter_correction.",
+    allowed_missing_prefixes = []
+    if backbone.mvt1.hidden_state_enabled:
+        allowed_missing_prefixes.extend(
+            ("mvt1.F_phi.", "mvt1.filter_correction.")
         )
+    if continuous_rotation:
+        allowed_missing_prefixes.append("mvt1.feat_fc_rot6d.")
+    if rot_6d:
+        allowed_missing_prefixes.append("mvt1.feat_fc.")
+    allowed_missing_prefixes = tuple(allowed_missing_prefixes)
     missing = [
         key
         for key in missing
@@ -230,29 +280,190 @@ def load_initial_checkpoint(backbone, checkpoint_path):
             "Initial checkpoint is incompatible with the BridgeVLA model: "
             f"missing={missing}, unexpected={unexpected}"
         )
+    if continuous_rotation:
+        _initialize_continuous_rotation_head(backbone, source_state)
+    if rot_6d:
+        _initialize_rot6d_feat_fc(backbone, source_state)
     print(
         f"Loaded initial checkpoint: {checkpoint_path} "
         f"(epoch={checkpoint.get('epoch', 'unknown')})"
     )
 
 
-def freeze_for_hidden_state_route(backbone):
-    """Freeze BridgeVLA and train only the hidden-state route modules."""
+def _initialize_continuous_rotation_head(backbone, source_state):
+    """Warm-start the replacement 6D head near identity rotation.
+
+    Hidden layers are averaged from the old x/y/z heads. The final projection is
+    zero-initialised with a bias of the identity ortho6d (columns e1,e2), so the
+    head starts at a valid rotation instead of random pose noise.
+    """
+    head = backbone.mvt1.feat_fc_rot6d
+    axes = ("x", "y", "z")
+    with torch.no_grad():
+        for layer_index in (0, 2):
+            weight_keys = [
+                f"mvt1.feat_fc_{axis}.{layer_index}.weight" for axis in axes
+            ]
+            bias_keys = [
+                f"mvt1.feat_fc_{axis}.{layer_index}.bias" for axis in axes
+            ]
+            if all(key in source_state for key in weight_keys):
+                head[layer_index].weight.copy_(
+                    torch.stack([source_state[key] for key in weight_keys]).mean(0)
+                )
+            if all(key in source_state for key in bias_keys):
+                head[layer_index].bias.copy_(
+                    torch.stack([source_state[key] for key in bias_keys]).mean(0)
+                )
+        # Final linear is index 4 in get_feat_fc. Start at identity rotation.
+        final = head[4]
+        if isinstance(final, torch.nn.Linear) and final.out_features == 6:
+            final.weight.zero_()
+            final.bias.copy_(
+                torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=final.bias.dtype)
+            )
+    print(
+        "Initialized continuous 6D head: averaged hidden layers from discrete "
+        "rotation heads, final projection set to identity ortho6d."
+    )
+
+
+def _initialize_rot6d_feat_fc(head_owner, source_state):
+    """Warm-start BridgeVLA++ ``feat_fc`` (rot_ver=2, feat_dim=10) from model_80.
+
+    Layout: [6D rot | grip(2) | collision(2)]. Hidden layers are averaged from
+    the discrete x/y/z heads and feat_fc_ex_rot. The rotation slice of the final
+    projection is zero-initialised with bias = identity ortho6d (columns e1,e2);
+    the grip/collision slice is copied from feat_fc_ex_rot so those logits stay
+    calibrated.
+    """
+    head = head_owner.mvt1.feat_fc
+    axes = ("x", "y", "z")
+    with torch.no_grad():
+        for layer_index in (0, 2):
+            weight_keys = [
+                f"mvt1.feat_fc_{axis}.{layer_index}.weight" for axis in axes
+            ] + ["mvt1.feat_fc_ex_rot.%d.weight" % layer_index]
+            bias_keys = [
+                f"mvt1.feat_fc_{axis}.{layer_index}.bias" for axis in axes
+            ] + ["mvt1.feat_fc_ex_rot.%d.bias" % layer_index]
+            weight_keys = [k for k in weight_keys if k in source_state]
+            bias_keys = [k for k in bias_keys if k in source_state]
+            if weight_keys:
+                head[layer_index].weight.copy_(
+                    torch.stack([source_state[k] for k in weight_keys]).mean(0)
+                )
+            if bias_keys:
+                head[layer_index].bias.copy_(
+                    torch.stack([source_state[k] for k in bias_keys]).mean(0)
+                )
+        # Final linear is index 4 in get_feat_fc.
+        final = head[4]
+        if isinstance(final, torch.nn.Linear) and final.out_features == 10:
+            final.weight.zero_()
+            final.bias.zero_()
+            final.bias[:6].copy_(
+                torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=final.bias.dtype)
+            )
+            ex_rot_key = "mvt1.feat_fc_ex_rot.4.weight"
+            ex_rot_bias_key = "mvt1.feat_fc_ex_rot.4.bias"
+            if ex_rot_key in source_state:
+                final.weight[6:].copy_(source_state[ex_rot_key])
+            if ex_rot_bias_key in source_state:
+                final.bias[6:].copy_(source_state[ex_rot_bias_key])
+    print(
+        "Initialized BridgeVLA++ rot_ver=2 feat_fc: hidden averaged from "
+        "discrete heads, rotation final = identity ortho6d, grip/coll copied "
+        "from feat_fc_ex_rot."
+    )
+
+
+def freeze_for_hidden_state_route(
+    backbone,
+    unfreeze_action_path=False,
+    discrete_action_lora=False,
+    lora_rank=8,
+    lora_alpha=16,
+):
+    """Freeze BridgeVLA and train the filter or a selected action path."""
     if not backbone.mvt1.hidden_state_enabled:
         raise ValueError(
             "hidden_state_route_only requires hidden_state_enabled=True"
         )
+    if unfreeze_action_path and discrete_action_lora:
+        raise ValueError(
+            "Choose either full action-path unfreezing or discrete-head LoRA"
+        )
     for parameter in backbone.parameters():
         parameter.requires_grad = False
+
+    if discrete_action_lora:
+        if int(getattr(backbone.mvt1, "rot_ver", 0)) != 1:
+            raise ValueError(
+                "--hidden_state_lora_discrete_action_path requires mvt.rot_ver=1"
+            )
+        targets = inject_discrete_action_lora(
+            backbone.mvt1, rank=lora_rank, alpha=lora_alpha
+        )
+        trainable_count = sum(
+            parameter.numel()
+            for parameter in backbone.parameters()
+            if parameter.requires_grad
+        )
+        if trainable_count == 0:
+            raise RuntimeError("discrete action LoRA injected no trainable parameters")
+        print(
+            "Training discrete action LoRA only (filter and base model frozen): "
+            f"targets={targets} rank={lora_rank} alpha={lora_alpha} "
+            f"trainable={trainable_count}"
+        )
+        return
+
     trainable_modules = [
         backbone.mvt1.F_phi,
         backbone.mvt1.filter_correction,
     ]
+    if unfreeze_action_path:
+        continuous_rotation = bool(
+            getattr(backbone.mvt1, "continuous_rotation", False)
+        )
+        rot_ver = int(getattr(backbone.mvt1, "rot_ver", 0))
+        if continuous_rotation:
+            trainable_modules.extend(
+                [
+                    backbone.mvt1.feat_fc_init_bn,
+                    backbone.mvt1.feat_fc_rot6d,
+                    backbone.mvt1.up0.net_out[4],
+                    backbone.mvt1.up0.net_mask[2],
+                ]
+            )
+        elif rot_ver == 2:
+            # BridgeVLA++ 6D head + the convex-upsample output tails.
+            trainable_modules.extend(
+                [
+                    backbone.mvt1.feat_fc,
+                    backbone.mvt1.up0.net_out[4],
+                    backbone.mvt1.up0.net_mask[2],
+                ]
+            )
+        else:
+            raise ValueError(
+                "--hidden_state_unfreeze_action_path requires "
+                "mvt.continuous_rotation=True or mvt.rot_ver=2"
+            )
     for module in trainable_modules:
         for parameter in module.parameters():
             parameter.requires_grad = True
-    trainable_names = [module.__class__.__name__ for module in trainable_modules]
-    print("Training only hidden-state modules: " + ", ".join(trainable_names))
+    trainable_names = [
+        module.__class__.__name__ for module in trainable_modules
+    ]
+    if unfreeze_action_path:
+        print(
+            "Training filter plus finite action path: "
+            + ", ".join(trainable_names)
+        )
+    else:
+        print("Training only hidden-state modules: " + ", ".join(trainable_names))
 
 
 def setup_distributed(backend="nccl", port=None):
@@ -299,12 +510,30 @@ def setup_distributed(backend="nccl", port=None):
     )
 
 
+def seed_training(seed, rank):
+    """Seed Python, NumPy, and Torch before dataset/model construction.
+
+    The filter projection has its own frozen seed, but the trainable route and
+    replay sampling also need an explicit seed for matched ablations.  Offset
+    the process-local streams by rank while keeping single-GPU runs exactly
+    reproducible from the requested base seed.
+    """
+    seed = int(seed) + int(rank)
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print(f"Training seed: base={int(seed) - int(rank)} rank={int(rank)} effective={seed}")
+
+
 
 def experiment(cmd_args):
     setup_distributed()
     local_rank = int(os.environ["LOCAL_RANK"])
     device_id = f"cuda:{local_rank}"
     torch.cuda.set_device(device_id)
+    if cmd_args.seed is not None:
+        seed_training(cmd_args.seed, dist.get_rank())
     exp_cfg = exp_cfg_mod.get_cfg_defaults()
 
     if cmd_args.exp_cfg_path != "":
@@ -416,10 +645,37 @@ def experiment(cmd_args):
     if cmd_args.mvt_cfg_opts != "":
         mvt_cfg.merge_from_list(cmd_args.mvt_cfg_opts.split(" "))
 
-    mvt_cfg.feat_dim = get_num_feat(exp_cfg.peract)
+    if int(getattr(mvt_cfg, "rot_ver", 0)) == 2:
+        # BridgeVLA++ continuous 6D regression head: 6D rot + grip(2) + coll(2).
+        mvt_cfg.feat_dim = 6 + 2 + 2
+    else:
+        mvt_cfg.feat_dim = get_num_feat(exp_cfg.peract)
     if cmd_args.hidden_state_route_only and not mvt_cfg.hidden_state_enabled:
         raise ValueError(
             "--hidden_state_route_only requires hidden_state_enabled=True"
+        )
+    if (
+        cmd_args.hidden_state_unfreeze_action_path
+        and not cmd_args.hidden_state_route_only
+    ):
+        raise ValueError(
+            "--hidden_state_unfreeze_action_path requires "
+            "--hidden_state_route_only"
+        )
+    if (
+        cmd_args.hidden_state_lora_discrete_action_path
+        and not cmd_args.hidden_state_route_only
+    ):
+        raise ValueError(
+            "--hidden_state_lora_discrete_action_path requires "
+            "--hidden_state_route_only"
+        )
+    if (
+        cmd_args.hidden_state_lora_discrete_action_path
+        and cmd_args.hidden_state_unfreeze_action_path
+    ):
+        raise ValueError(
+            "Discrete action LoRA and full action-path unfreezing are mutually exclusive"
         )
     if sequence_training and not mvt_cfg.hidden_state_enabled:
         raise ValueError(
@@ -465,7 +721,13 @@ def experiment(cmd_args):
     if cmd_args.init_checkpoint is not None:
         load_initial_checkpoint(backbone, cmd_args.init_checkpoint)
     if cmd_args.hidden_state_route_only:
-        freeze_for_hidden_state_route(backbone)
+        freeze_for_hidden_state_route(
+            backbone,
+            unfreeze_action_path=cmd_args.hidden_state_unfreeze_action_path,
+            discrete_action_lora=cmd_args.hidden_state_lora_discrete_action_path,
+            lora_rank=cmd_args.lora_rank,
+            lora_alpha=cmd_args.lora_alpha,
+        )
 
     backbone = backbone.to(local_rank)
     # Chronological sequence updates accumulate several forward graphs. The
@@ -486,6 +748,7 @@ def experiment(cmd_args):
         cameras=CAMERAS,
         log_dir=f"{log_dir}/test_run/",
         hidden_state_route_only=cmd_args.hidden_state_route_only,
+        hidden_state_unfreeze_action_path=cmd_args.hidden_state_unfreeze_action_path,
         **exp_cfg.peract,
         **exp_cfg.rvt,
     )
@@ -580,6 +843,12 @@ if __name__ == "__main__":
     parser.add_argument("--exp_cfg_opts", type=str, default="")
     parser.add_argument("--exp_note", type=str, default="")
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Base seed for matched training runs; unset preserves legacy behavior.",
+    )
+    parser.add_argument(
         "--log_dir",
         type=str,
         default=os.path.abspath(os.path.join(os.path.dirname(__file__), "../..", "outputs")),
@@ -598,6 +867,26 @@ if __name__ == "__main__":
     parser.add_argument("--pretrain_path", type=str, default=None)
     parser.add_argument("--init_checkpoint", type=str, default=None)
     parser.add_argument("--hidden_state_route_only", action="store_true")
+    parser.add_argument(
+        "--hidden_state_unfreeze_action_path",
+        action="store_true",
+        help=(
+            "With hidden_state_route_only, also train the continuous 6D "
+            "action path (BridgeVLA++ rot_ver=2 feat_fc or the legacy "
+            "continuous_rotation head) plus the convex-upsample output tails."
+        ),
+    )
+    parser.add_argument(
+        "--hidden_state_lora_discrete_action_path",
+        action="store_true",
+        help=(
+            "With hidden_state_route_only and a discrete rot_ver=1 checkpoint, "
+            "train zero-initialized LoRA deltas on the final x/y/z rotation "
+            "and grip/collision projections while freezing the filter and base model."
+        ),
+    )
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument(
         "--hidden_state_sequence_training",
         action="store_true",

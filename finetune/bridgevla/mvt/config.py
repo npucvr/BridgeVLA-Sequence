@@ -26,6 +26,9 @@ _C.cvx_up = False
 _C.xops = False
 _C.rot_ver = 0
 _C.num_rot = 72
+# Replace the autoregressive per-axis Euler logits with one continuous 6D
+# rotation head. Keep disabled by default for old checkpoint compatibility.
+_C.continuous_rotation = False
 _C.stage_two = False
 _C.st_sca = 4
 _C.st_wpt_loc_aug = 0.05
