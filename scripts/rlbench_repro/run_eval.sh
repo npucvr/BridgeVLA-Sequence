@@ -4,6 +4,8 @@
 # Default protocol: 25 episodes per task; max 35 decisions for place_cups and
 # stack_blocks, and 25 decisions for the other tasks.  eval.py records the
 # per-task horizon in eval_config.yaml.
+# Optional PLANNING_RETRIES=1 or 2 retries the same action only for a wrapped
+# ConfigurationPathError; the default is 0 (disabled).
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 RUN_ID="${1:?usage: run_eval.sh <run_id> [gpu_id]}"
@@ -50,6 +52,7 @@ python eval.py \
   --tasks all \
   --eval-episodes "$EVAL_EPISODES" \
   --episode-length "$EPISODE_LENGTH" \
+  --planning-retries "${PLANNING_RETRIES:-0}" \
   --log-name "$LOG_NAME" \
   --eval-output-root "$EVAL_OUTPUT_ROOT" \
   --device "$GPU_ID" \

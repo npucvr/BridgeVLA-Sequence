@@ -155,6 +155,8 @@ RESULT_LOG_DIR=rlbench_eval_split \
 ```
 Set `GPU_IDS=0` for sequential repeats, or `GPU_IDS=0,2` to use two concurrent slots; the launcher schedules five runs in waves. When running multiple CoppeliaSim instances, map isolated displays, for example
 `GPU_IDS=0,2 DISPLAY_IDS=:1.0,:2.0`. Use `run_eval.sh` directly when only one evaluation run is needed.
+
+RLBench 运动规划重试默认关闭。使用 `scripts/rlbench_repro/run_eval.sh` 做有界诊断重试时，可设置 `PLANNING_RETRIES=1` 或 `PLANNING_RETRIES=2`；只有 RLBench 将 PyRep `ConfigurationPathError` 包装成 `InvalidActionError` 时，才会对完全相同的动作重试。动作形状、四元数或 workspace 检查错误不会重试。重试次数会写入 `eval_config.yaml`；该协议的分数应与无重试协议及此前五轮汇总分开报告。
 2. **COLOSSEUM Evaluation:** To evaluate on COLOSSEUM, you should first preprocess the eval data as the original format is not suitable for our data loading. Run the following code to preprocess them. Or you can directly download the cleaned data we have tided from [here](https://huggingface.co/datasets/LPY/BridgeVLA_COLOSSUM_EVAL_DATA/tree/main).
 ```bash
 cd finetune/Colosseum

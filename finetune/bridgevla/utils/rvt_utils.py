@@ -145,6 +145,16 @@ def get_eval_parser():
         default=25,
         help="maximum control steps allowed for each episode",
     )
+    parser.add_argument(
+        "--planning-retries",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help=(
+            "extra attempts for the same action only when RLBench wraps a "
+            "ConfigurationPathError; default 0 disables retries"
+        ),
+    )
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--ground-truth", action="store_true", default=False)
     parser.add_argument("--exp_cfg_path", type=str, default=None)

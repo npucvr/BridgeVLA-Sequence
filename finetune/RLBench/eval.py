@@ -169,6 +169,7 @@ def eval(
     model_name="debug",
     visualize=False,
     visualize_root_dir="",
+    planning_retries=0,
 ):
     agent.eval()
 
@@ -176,7 +177,9 @@ def eval(
     obs_config = utils.create_obs_config(CAMERAS, camera_resolution, method_name="")
 
     gripper_mode = Discrete()
-    arm_action_mode = EndEffectorPoseViaPlanning()
+    arm_action_mode = EndEffectorPoseViaPlanning(
+        planning_retries=planning_retries
+    )
     action_mode = MoveArmThenGripper(arm_action_mode, gripper_mode)
 
     task_files = [
@@ -460,6 +463,7 @@ def _eval(args):
             start_episode=args.start_episode,
             eval_episodes=args.eval_episodes,
             episode_length=args.episode_length,
+            planning_retries=args.planning_retries,
             replay_ground_truth=args.ground_truth,
             device=args.device,
             headless=args.headless,
