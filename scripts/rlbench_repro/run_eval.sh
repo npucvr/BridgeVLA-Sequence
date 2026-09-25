@@ -1,7 +1,9 @@
 #!/bin/bash
 # Usage: bash scripts/rlbench_repro/run_eval.sh <run_id> [gpu_id]
 # Runs the released BridgeVLA RLBench checkpoint on all 18 tasks.
-# Default protocol: 25 episodes per task, max 25 decisions per episode.
+# Default protocol: 25 episodes per task; max 35 decisions for place_cups and
+# stack_blocks, and 25 decisions for the other tasks.  eval.py records the
+# per-task horizon in eval_config.yaml.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 RUN_ID="${1:?usage: run_eval.sh <run_id> [gpu_id]}"

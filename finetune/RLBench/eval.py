@@ -62,6 +62,24 @@ from bridgevla.utils.rvt_utils import (
 from bridgevla.utils.rvt_utils import load_agent as load_agent_state
 import os 
 
+
+# BridgeVLA++'s released RLBench protocol uses a 35-step budget only for
+# place_cups and stack_blocks; all other tasks keep the 25-step budget.  The
+# command-line --episode-length remains an escape hatch for explicit horizon
+# studies (for example, setting it to 35 makes every task 35 steps).
+DEFAULT_EPISODE_LENGTH = 25
+TASK_EPISODE_LENGTH_OVERRIDES = {
+    "place_cups": 35,
+    "stack_blocks": 35,
+}
+
+
+def get_task_episode_length(task_name, episode_length):
+    if episode_length == DEFAULT_EPISODE_LENGTH:
+        return TASK_EPISODE_LENGTH_OVERRIDES.get(task_name, episode_length)
+    return episode_length
+
+
 def load_agent(
     model_path=None,
     exp_cfg_path=None,
@@ -219,6 +237,19 @@ def eval(
 
     scores = []
     for task_id in range(num_tasks):
+        task_name = tasks[task_id]
+        task_episode_length = get_task_episode_length(task_name, episode_length)
+
+        # The environment contributes both episode termination and the
+        # normalized time-in-state feature, so update it together with the
+        # rollout-generator horizon for every task.
+        eval_env._episode_length = task_episode_length
+        if verbose:
+            print(
+                f"Evaluating task {task_name} with max episode length "
+                f"{task_episode_length}"
+            )
+
         task_rewards = []
         language_goals=[]
         for ep in range(start_episode, start_episode + eval_episodes):
@@ -228,7 +259,7 @@ def eval(
                     step_signal=step_signal,
                     env=eval_env,
                     agent=agent,
-                    episode_length=episode_length,
+                    episode_length=task_episode_length,
                     timesteps=1,
                     eval=True,
                     eval_demo_seed=ep,
@@ -245,7 +276,7 @@ def eval(
                     step_signal=step_signal,
                     env=eval_env,
                     agent=agent,
-                    episode_length=episode_length,
+                    episode_length=task_episode_length,
                     timesteps=1,
                     eval=True,
                     eval_demo_seed=ep,
@@ -268,7 +299,6 @@ def eval(
                 current_task_id = transition.info["active_task_id"]
                 assert current_task_id == task_id
 
-            task_name = tasks[task_id]
             reward = episode_rollout[-1].reward
             task_rewards.append(reward)
             lang_goal = eval_env._lang_goal
@@ -281,7 +311,6 @@ def eval(
         # report summaries
         summaries = []
         summaries.extend(stats_accumulator.pop())
-        task_name = tasks[task_id]
         if logging:
             # writer csv first
             with open(os.path.join(log_dir, csv_file), "a") as csv_fp:
@@ -469,6 +498,10 @@ if __name__ == "__main__":
     else:
         args.eval_output_root = os.path.abspath(os.path.expanduser(args.eval_output_root))
     args.eval_log_dir = os.path.join(args.eval_output_root, args.log_name)
+    args.task_episode_lengths = {
+        task: get_task_episode_length(task, args.episode_length)
+        for task in RLBENCH_TASKS
+    }
 
     os.makedirs(args.eval_log_dir, exist_ok=True)
 
