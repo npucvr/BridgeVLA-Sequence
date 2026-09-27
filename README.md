@@ -74,7 +74,7 @@ What you need to do is to modify the checking branch in the file and then run th
 cd pretrain
 bash pretrain.sh --branches BRANCH_OPTION --config_path PATH_TO_CONFIG_FILE --json_detection_path PATH_TO_DETECTION_JSON --image_folder PATH_TO_IMAGE_FOLDER
 ```
-2. **RLBench Fine-tuning:** To finetune on RLBench, you should first prepare the dataset. You can generate the train and test data yourself by following the instructions in [PerAct repository](https://github.com/peract/peract?tab=readme-ov-file#data-generation). Or you can directly download the dataset we generate to fully reproduce our results [here](https://huggingface.co/datasets/LPY/BridgeVLA_RLBench_TRAIN_DATA/tree/main). To improve the data loading speed, we will first convert the raw data into replay buffer. The training code will automatically do that if it does not find the replay buffer. Meanwhile, you can also directly download the replay buffer we preprocess [here](https://huggingface.co/datasets/LPY/BridgeVLA_RLBench_TRAIN_BUFFER/tree/main). After the data is ready, you can use the `finetune/RLBench/train.sh` file to finetune the model. Please run the following code:
+2. **RLBench Fine-tuning:** To finetune on RLBench, you should first prepare the dataset. You can generate the train and test data yourself by following the instructions in [PerAct repository](https://github.com/peract/peract?tab=readme-ov-file#data-generation). Or you can directly download the dataset we generate to fully reproduce our results [here](https://huggingface.co/datasets/LPY/BridgeVLA_RLBench_TRAIN_DATA/tree/main). The replay conversion described below is an engineering cache for faster iteration; it does not change the model or training method. Runtime data must be read from the shared NFS path configured by `scripts/bridgevla_runtime.sh`. The historical `encoded_v1` layout is retired. After the data is ready, you can use the `finetune/RLBench/train.sh` file to finetune the model. Please run the following code:
 ```bash
 cd finetune/RLBench
 bash train.sh --exp_cfg_path  configs/rlbench_config.yaml \
@@ -99,7 +99,9 @@ bash train.sh \
               --log_dir PATH_TO_LOG_DIR
 ```
 
-该模式继续读取旧的 one-step replay 文件；sequence sampler 会沿 action forward 读取同一 replay task，并用 terminal/timeout/`valid_mask` 阻止跨 episode 展开。`hidden_state_enabled=False` 时仍使用原始 independent-transition 路径。
+该模式需要 episode-aware sequence 数据；sequence sampler 会沿 action forward 读取同一 episode，并用 terminal/timeout/`valid_mask` 阻止跨 episode 展开。新的编码格式完成前，不启动正式 sequence 训练；已废弃的 `encoded_v1` 不允许用于训练。
+
+若要只校准离散旋转头，可在 `rot_ver=1` checkpoint 上组合 `--hidden_state_route_only` 与 `--hidden_state_lora_discrete_rotation_only`。它只给 `feat_fc_x/y/z` 的最终线性层添加零初始化 LoRA；平移头、grip/collision 头、filter 和其余基础模型保持冻结。此参数与完整离散动作头 LoRA `--hidden_state_lora_discrete_action_path` 互斥；未启用时，已有训练行为不变。LoRA rank 和 alpha 由 `--lora_rank`、`--lora_alpha` 控制。
 
 RLBench 训练入口支持 PyTorch DDP。单机多卡时，`GPUS_PER_NODE` 必须与可见 GPU 数量一致；`bs` 是每张 GPU 的 batch size，`train_iter` 按全局有效 batch 计算。例如，要保持单卡 `bs=4` 的实验协议，可以使用两张 GPU、每卡 `bs=2`：
 
@@ -122,7 +124,7 @@ CUDA_VISIBLE_DEVICES=0,1 GPUS_PER_NODE=2 bash train.sh \
 ~/.config/bridgevla/$(hostname -s).env
 ```
 
-该文件集中保存本机的 conda、CUDA、CoppeliaSim、RLBench train/eval/replay 和模型权重路径，例如 `BRIDGEVLA_RLBENCH_DATA_FOLDER`、`BRIDGEVLA_RLBENCH_TRAIN_REPLAY_DIR`、`EVAL_DATAFOLDER`、`BRIDGEVLA_INIT_CHECKPOINT` 和 `BRIDGEVLA_PALIGEMMA_PATH`。代码和模型权重从 NFS 仓库加载；训练和评估实际读取的 train/eval/replay 数据应指向对应机器的本地高速盘。
+该文件集中保存本机的 conda、CUDA、CoppeliaSim、RLBench train/eval/replay 和模型权重路径，例如 `BRIDGEVLA_RLBENCH_DATA_FOLDER`、`BRIDGEVLA_RLBENCH_TRAIN_REPLAY_DIR`、`EVAL_DATAFOLDER`、`BRIDGEVLA_INIT_CHECKPOINT` 和 `BRIDGEVLA_PALIGEMMA_PATH`。代码、模型权重和训练/评估数据从 NFS 权威路径加载。episode-aware `encoded_train_v2` 尚未接入前，不启动正式 encoded sequence 训练；不要设置 `BRIDGEVLA_REPLAY_FORMAT=encoded_v1`，该格式已废弃并会被入口拒绝。
 
 3. **COLOSSEUM Fine-tuning:** For COLOSSEUM, we fine-tune the model with the training dataset provided by the [COLOSSEUM challenge](https://huggingface.co/datasets/colosseum/colosseum-challenge/tree/main). Similarly, our training code will first convert the raw data into replay buffer. You can also directly download the replay buffer we preprocess [here](https://huggingface.co/datasets/LPY/BridgeVLA_COLOSSEUM_TRAIN_BUFFER/tree/main). Then, you can use the `finetune/Colosseum/train.sh` file to finetune the model. Please run the following code:
 ```bash
