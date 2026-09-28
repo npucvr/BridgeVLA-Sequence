@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Build the first episode-aware training store directly from raw RLBench data.
+"""Build the episode-aware training store from packed RLBench task archives.
 
 The command intentionally accepts only the shared ``/remote_databuffer``
-paths.  It reads one raw episode at a time, turns the existing keypoint/action
-semantics into a chronological payload, and writes immutable chunks with
-``EpisodeStoreWriter``.  FilterCorrection state is never serialized.
+paths.  Source episodes are streamed from per-task archives (no expanded
+small-file tree), turned into chronological keypoint/action payloads, and
+written as immutable chunks with ``EpisodeStoreWriter``.  FilterCorrection
+state is never serialized.
 
 This is an encoder/smoke entry point for ``encoded_train_v2``.  The training
 adapter is a separate change; until it is wired and validated, the normal
@@ -15,8 +16,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
-import re
+import multiprocessing as mp
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -32,7 +34,11 @@ sys.path.insert(0, str(UTILS_ROOT))
 
 from dataset import _clip_encode_text, _get_action  # noqa: E402
 from episode_store import EpisodeStoreWriter  # noqa: E402
-from peract_colab.rlbench.utils import get_stored_demo  # noqa: E402
+from tar_episode_source import (  # noqa: E402
+    archive_path_for_task,
+    discover_task_archives,
+    iter_episodes_from_archive,
+)
 from peract_utils_rlbench import (  # noqa: E402
     CAMERAS,
     SCENE_BOUNDS,
@@ -45,15 +51,12 @@ from bridgevla.libs.peract.helpers.demo_loading_utils import (  # noqa: E402
 from bridgevla.libs.peract.helpers.utils import extract_obs  # noqa: E402
 
 
-_EPISODE_RE = re.compile(r"^episode([0-9]+)$")
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--data-root",
+        "--archives-root",
         required=True,
-        help="raw RLBench_TRAIN_DATA under /remote_databuffer",
+        help="packed RLBench_TRAIN_DATA archives under /remote_databuffer",
     )
     parser.add_argument(
         "--destination",
@@ -77,6 +80,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-cache-dir", default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=2027)
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=6,
+        help="number of task-parallel encode workers",
+    )
     return parser.parse_args()
 
 
@@ -111,15 +120,6 @@ def _assert_shared_nfs(path: Path, label: str) -> Path:
     return path
 
 
-def _episode_ids(episodes_root: Path) -> list[int]:
-    result = []
-    for path in episodes_root.iterdir():
-        match = _EPISODE_RE.match(path.name)
-        if match and path.is_dir():
-            result.append(int(match.group(1)))
-    return sorted(result)
-
-
 def _stack(values: Sequence[object], field: str) -> np.ndarray:
     arrays = [np.asarray(value) for value in values]
     try:
@@ -127,15 +127,6 @@ def _stack(values: Sequence[object], field: str) -> np.ndarray:
     except ValueError as exc:
         shapes = [tuple(array.shape) for array in arrays]
         raise ValueError(f"inconsistent shapes for {field}: {shapes}") from exc
-
-
-def _description(episode_dir: Path) -> str:
-    path = episode_dir / "variation_descriptions.pkl"
-    with path.open("rb") as handle:
-        descriptions = pickle.load(handle)
-    if not descriptions:
-        raise ValueError(f"episode has no variation description: {episode_dir}")
-    return str(descriptions[0])
 
 
 def _language_embedding(clip_model, description: str, device: torch.device) -> np.ndarray:
@@ -147,22 +138,22 @@ def _language_embedding(clip_model, description: str, device: torch.device) -> n
     return embeddings[0].float().detach().cpu().numpy()
 
 
-def _encode_episode(
+def _encode_demo(
     *,
     task: str,
     episode_id: int,
-    episodes_root: Path,
+    demo,
+    description: str,
     clip_model,
     device: torch.device,
     episode_length: int,
 ) -> Mapping[str, object]:
-    episode_dir = episodes_root / f"episode{episode_id}"
-    demo = get_stored_demo(data_path=str(episodes_root), index=episode_id)
-    description = _description(episode_dir)
     language_embedding = _language_embedding(clip_model, description, device)
     keypoints = list(keypoint_discovery(demo))
     if not keypoints:
-        raise ValueError(f"episode has no keypoints: {episode_dir}")
+        raise ValueError(
+            f"episode has no keypoints: {task}#{episode_id}"
+        )
 
     observation_rows: dict[str, list[np.ndarray]] = {}
     actions: list[np.ndarray] = []
@@ -270,53 +261,28 @@ def _encode_episode(
     }
 
 
-def _task_names(data_root: Path, requested: Iterable[str] | None) -> list[str]:
+def _task_names(archives_root: Path, requested: Iterable[str] | None) -> list[str]:
     if requested:
         names = [str(item) for item in requested]
     else:
-        names = sorted(
-            path.name
-            for path in data_root.iterdir()
-            if (path / "all_variations" / "episodes").is_dir()
-        )
+        names = discover_task_archives(archives_root)
     result = []
     for task in names:
-        episodes_root = data_root / task / "all_variations" / "episodes"
-        if not episodes_root.is_dir():
-            raise FileNotFoundError(f"missing raw episode root for task={task}: {episodes_root}")
+        archive_path_for_task(archives_root, task)
         result.append(task)
     return result
 
 
-def main() -> int:
-    args = _parse_args()
-    if args.max_episodes_per_task < 0:
-        raise ValueError("max-episodes-per-task must be non-negative")
-    if args.episode_length < 2:
-        raise ValueError("episode-length must be at least 2")
-    data_root = _assert_shared_nfs(Path(args.data_root), "data-root")
-    destination = _assert_shared_nfs(Path(args.destination), "destination")
-    if destination.exists():
-        raise FileExistsError(f"refusing to replace existing destination: {destination}")
-
-    import clip
-
-    device = torch.device(args.device)
-    clip_kwargs = {}
-    if args.clip_cache_dir:
-        clip_kwargs["download_root"] = args.clip_cache_dir
-    clip_model, _ = clip.load("RN50", device=device, **clip_kwargs)
-    clip_model.eval()
-    tasks = _task_names(data_root, args.tasks)
+def _source_and_schema(archives_root: Path, episode_length: int, seed: int):
     source = {
-        "root": str(data_root),
+        "root": str(archives_root),
         "split": "train",
-        "layout": "task/all_variations/episodes/episodeN",
+        "layout": "task.tar.xz!all_variations/episodes/episodeN",
         "keypoint_method": "heuristic",
         "rotation_resolution": int(ROTATION_RESOLUTION),
         "voxel_sizes": [int(value) for value in VOXEL_SIZES],
-        "episode_length": int(args.episode_length),
-        "seed": int(args.seed),
+        "episode_length": int(episode_length),
+        "seed": int(seed),
     }
     schema = {
         "payload": "bridgevla_episode_payload",
@@ -325,62 +291,248 @@ def main() -> int:
         "sequence_unit": "heuristic_keypoint",
         "hidden_state": "runtime_only",
     }
+    return source, schema
+
+
+def _encode_task_to_part(job: Mapping[str, object]) -> dict:
+    """Worker: encode one task archive into a standalone part store."""
+    task = str(job["task"])
+    archives_root = Path(str(job["archives_root"]))
+    part_dir = Path(str(job["part_dir"]))
+    max_episodes = int(job["max_episodes"])
+    episode_length = int(job["episode_length"])
+    max_chunk_bytes = int(job["max_chunk_bytes"])
+    device_name = str(job["device"])
+    clip_cache_dir = job.get("clip_cache_dir")
+    source = dict(job["source"])
+    schema = dict(job["schema"])
+
+    import clip
+
+    device = torch.device(device_name)
+    clip_kwargs = {}
+    if clip_cache_dir:
+        clip_kwargs["download_root"] = str(clip_cache_dir)
+    clip_model, _ = clip.load("RN50", device=device, **clip_kwargs)
+    clip_model.eval()
+
+    archive_path = archive_path_for_task(archives_root, task)
+    if part_dir.exists():
+        raise FileExistsError(f"part store already exists: {part_dir}")
+
     writer = EpisodeStoreWriter(
-        destination,
+        part_dir,
         split="train",
-        max_chunk_bytes=args.max_chunk_bytes,
+        max_chunk_bytes=max_chunk_bytes,
         schema=schema,
         source=source,
     )
     encoded = 0
     started = time.perf_counter()
     try:
-        for task in tasks:
-            episodes_root = data_root / task / "all_variations" / "episodes"
-            episode_ids = _episode_ids(episodes_root)
-            if args.max_episodes_per_task:
-                episode_ids = episode_ids[: args.max_episodes_per_task]
-            for episode_id in episode_ids:
-                payload = _encode_episode(
-                    task=task,
-                    episode_id=episode_id,
-                    episodes_root=episodes_root,
-                    clip_model=clip_model,
-                    device=device,
-                    episode_length=args.episode_length,
-                )
-                writer.add_episode(
-                    task,
-                    episode_id,
-                    payload,
-                    valid_length=int(payload["valid_length"]),
-                )
-                encoded += 1
+        for episode_id, demo, description in iter_episodes_from_archive(archive_path):
+            if max_episodes and encoded >= max_episodes:
+                break
+            payload = _encode_demo(
+                task=task,
+                episode_id=episode_id,
+                demo=demo,
+                description=description,
+                clip_model=clip_model,
+                device=device,
+                episode_length=episode_length,
+            )
+            writer.add_episode(
+                task,
+                episode_id,
+                payload,
+                valid_length=int(payload["valid_length"]),
+            )
+            encoded += 1
+            print(
+                json.dumps(
+                    {
+                        "task": task,
+                        "episode_id": episode_id,
+                        "valid_length": int(payload["valid_length"]),
+                        "encoded": encoded,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        manifest = writer.finalize()
+    except Exception:
+        writer.abort()
+        raise
+    return {
+        "task": task,
+        "episodes": encoded,
+        "chunks": len(manifest["chunks"]),
+        "seconds": round(time.perf_counter() - started, 3),
+        "part_dir": str(part_dir),
+    }
+
+
+def _merge_part_stores(
+    *,
+    tasks: Sequence[str],
+    parts_dir: Path,
+    destination: Path,
+    split: str,
+    schema: Mapping[str, object],
+    source: Mapping[str, object],
+) -> dict:
+    """Merge per-task part stores into one episode store directory."""
+    building = destination.with_name(f".{destination.name}.building-merge")
+    if building.exists():
+        shutil.rmtree(building)
+    chunks_dir = building / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=False)
+
+    merged_tasks: dict[str, dict] = {}
+    merged_chunks: list[dict] = []
+    episode_total = 0
+
+    for task in sorted(tasks):
+        part_manifest_path = parts_dir / task / "manifest.json"
+        with part_manifest_path.open("r", encoding="utf-8") as handle:
+            part_manifest = json.load(handle)
+        local_chunks = part_manifest["chunks"]
+        chunk_remap: dict[int, int] = {}
+        for local_index, chunk_spec in enumerate(local_chunks):
+            global_index = len(merged_chunks)
+            chunk_remap[local_index] = global_index
+            src = parts_dir / task / chunk_spec["file"]
+            dst_name = f"chunks/chunk-{global_index:06d}.bin"
+            dst = building / dst_name
+            os.link(src, dst)
+            merged_chunks.append(
+                {
+                    "file": dst_name,
+                    "bytes": int(chunk_spec["bytes"]),
+                    "sha256": str(chunk_spec["sha256"]),
+                }
+            )
+
+        task_spec = part_manifest["tasks"][task]
+        remapped_episodes = []
+        for episode in task_spec["episodes"]:
+            remapped = dict(episode)
+            remapped["chunk"] = chunk_remap[int(episode["chunk"])]
+            remapped_episodes.append(remapped)
+        merged_tasks[task] = {
+            "episode_count": int(task_spec["episode_count"]),
+            "episodes": remapped_episodes,
+        }
+        episode_total += int(task_spec["episode_count"])
+
+    manifest = {
+        "format": "bridgevla_episode_store",
+        "version": 1,
+        "split": split,
+        "schema": dict(schema),
+        "source": dict(source),
+        "chunks": merged_chunks,
+        "tasks": merged_tasks,
+    }
+    manifest_path = building / "manifest.json"
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    if destination.exists():
+        raise FileExistsError(f"refusing to replace existing destination: {destination}")
+    os.replace(building, destination)
+    return {
+        "tasks": sorted(merged_tasks),
+        "episodes": episode_total,
+        "chunks": len(merged_chunks),
+    }
+
+
+def main() -> int:
+    args = _parse_args()
+    if args.max_episodes_per_task < 0:
+        raise ValueError("max-episodes-per-task must be non-negative")
+    if args.episode_length < 2:
+        raise ValueError("episode-length must be at least 2")
+    if args.jobs < 1:
+        raise ValueError("jobs must be positive")
+    archives_root = _assert_shared_nfs(Path(args.archives_root), "archives-root")
+    destination = _assert_shared_nfs(Path(args.destination), "destination")
+    if destination.exists():
+        raise FileExistsError(f"refusing to replace existing destination: {destination}")
+
+    tasks = _task_names(archives_root, args.tasks)
+    source, schema = _source_and_schema(archives_root, args.episode_length, args.seed)
+    parts_dir = destination.with_name(f".{destination.name}.parts-{os.getpid()}")
+    if parts_dir.exists():
+        raise FileExistsError(f"temporary parts directory already exists: {parts_dir}")
+    parts_dir.mkdir(parents=True, exist_ok=False)
+
+    jobs = [
+        {
+            "task": task,
+            "archives_root": str(archives_root),
+            "part_dir": str(parts_dir / task),
+            "max_episodes": int(args.max_episodes_per_task),
+            "episode_length": int(args.episode_length),
+            "max_chunk_bytes": int(args.max_chunk_bytes),
+            "device": args.device,
+            "clip_cache_dir": args.clip_cache_dir,
+            "source": source,
+            "schema": schema,
+        }
+        for task in tasks
+    ]
+
+    started = time.perf_counter()
+    results = []
+    context = mp.get_context("spawn")
+    try:
+        with context.Pool(processes=min(args.jobs, len(jobs))) as pool:
+            for result in pool.imap_unordered(_encode_task_to_part, jobs):
+                results.append(result)
                 print(
                     json.dumps(
                         {
-                            "task": task,
-                            "episode_id": episode_id,
-                            "valid_length": int(payload["valid_length"]),
-                            "encoded": encoded,
+                            "task_done": result["task"],
+                            "episodes": result["episodes"],
+                            "seconds": result["seconds"],
+                            "finished_tasks": len(results),
+                            "total_tasks": len(jobs),
                         },
                         ensure_ascii=False,
                         sort_keys=True,
                     ),
                     flush=True,
                 )
-        manifest = writer.finalize()
+        merged = _merge_part_stores(
+            tasks=tasks,
+            parts_dir=parts_dir,
+            destination=destination,
+            split="train",
+            schema=schema,
+            source=source,
+        )
     except Exception:
-        writer.abort()
+        shutil.rmtree(parts_dir, ignore_errors=True)
         raise
+    else:
+        shutil.rmtree(parts_dir, ignore_errors=True)
 
     print(
         json.dumps(
             {
                 "destination": str(destination),
-                "tasks": tasks,
-                "episodes": encoded,
-                "chunks": len(manifest["chunks"]),
+                "tasks": merged["tasks"],
+                "episodes": merged["episodes"],
+                "chunks": merged["chunks"],
+                "jobs": min(args.jobs, len(jobs)),
                 "seconds": round(time.perf_counter() - started, 3),
             },
             ensure_ascii=False,
