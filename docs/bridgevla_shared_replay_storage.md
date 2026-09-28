@@ -2,7 +2,7 @@
 
 ## 工程定位
 
-共享存储、episode 编码和 NFS 直读是为了支持快速、可复现的轻量化微调迭代的工程实现，不是模型或训练方法创新，也不改变既有任务、采样和评估协议。性能结果用于运维和工程选型，不应被解释为算法增益。
+共享存储、episode 编码和 NFS 直读是为了支持快速、可复现的轻量化微调迭代的工程实现，不是模型或训练方法创新，也不改变任务定义或训练采样语义。held-out 评估采用下文固定协议；评估器修复带来的分数变化属于协议校正，不应解释为算法增益。
 
 ## 目的
 
@@ -81,6 +81,30 @@ smoke 通过后仍需完成 18-task 构建、逐字段对照、sequence adapter 
 已验收：18 task × 25 = 450 episodes，约 535MB；与官方归档加载对比 `random_seed` / `variation_number` / 描述 / 步数一致；单 episode 元数据加载约 15–140ms。完整评估若还需要图像可视化，再从 `original/archives` 按需读取，不进入 reset 快速路径。
 
 训练和评估必须分别维护 manifest、source hash 和 split 标记。评估数据不得出现在训练编码的 fallback 搜索路径中；每次结果必须记录评估 manifest hash、episode 范围和 25/35 步协议。
+
+## 正式评估协议（held-out）
+
+自本协议起，RLBench held-out 评估统一使用 **评估器修复版**（`utils/improved_eval.py`），不再使用旧直通评估器作为正式基线。该协议不改模型与 success 判定，只修正评测端系统性误差：
+
+| 项 | 默认 | 说明 |
+|----|------|------|
+| `IMPROVED_EVAL` | `1` | collision flag 路由 + arm settling |
+| `IMPROVED_ASSET_FIX` | `1` | 已知 ghost 物体 `set_renderable` 并重采集观测 |
+| `IMPROVED_SETTLE` | `1` | gripper 前后等待臂速度低于 `IMPROVED_SETTLE_MAX_VEL` |
+| episode 范围 | 0–24 | 每任务 25 trials |
+| action budget | 25 / 35 | `place_cups`、`stack_blocks` 为 35，其余 25（`configs/improved_eval_step_limit.yml`） |
+
+正式结果必须写明：评估器协议版本（improved）、`eval_pack` manifest、任务列表、episode 范围与 step budget。多轮汇报用 mean±std（建议 ≥5 轮）。
+
+**对照参考**（18×25×5，model_80，H35）：
+
+| 协议 | 平均成功率 |
+|------|------------|
+| 论文 BridgeVLA（旧评估器） | 88.2 |
+| 旧评估器 + token 滤波实验 | 88.44 ± 0.80 |
+| **本协议（A0 + improved）** | **89.73 ± 0.73** |
+
+token 滤波类推理期增强（如 external `filt3r_akf`）不作为当前正式路线；相对提升应优先在本评估协议下归因。
 
 ## 运行规则
 

@@ -31,6 +31,7 @@
 - 模型权重（含 PaliGemma、BridgeVLA checkpoint、预训练权重）只维护在 `/remote_userdata/sunguodong/repos/BridgeVLA/data/bridgevla_ckpt`；各 GPU 节点不得保留本地权重副本。运行时通过 NFS 权威路径读取，缺失时阻塞并提示同步权重，不得改用节点本地残留路径。
 - 节点本地目录只用于运行环境（conda/envs）、短期程序缓存和结果临时文件；不得把本地目录作为训练/评估数据或模型权重的权威来源，也不得把一次性数据或权重副本写入正式配置。任务结束后清理本地 staging 与临时副本。
 - 训练、评估或其他长时间任务使用仓库提供的运行时入口 `scripts/bridgevla_runtime.sh`，不要依赖被忽略的个人环境脚本。
+- RLBench held-out 正式评估统一使用 improved 评估器协议（默认 `IMPROVED_EVAL=1`，episode 0–24，place_cups/stack_blocks 为 35 步，其余 25）；多轮结果报 mean±std。不要把评估器协议校正写成模型方法增益。
 - 真正启动资源密集型任务前，在**同一个执行 shell** 中确认当前 `hostname`、仓库 `pwd`、GPU 状态及已有进程；不得凭历史记录假定节点或显存可用。
 - 若通过 SSH 使用其他节点，远程命令也必须重新确认 hostname、仓库路径和 GPU；当前节点无需 SSH 回自己。
 - RLBench、Colosseum、GemBench 的仿真依赖相互隔离，使用各自的环境和配置；并发 CoppeliaSim 实例必须隔离 GPU 与 display。
