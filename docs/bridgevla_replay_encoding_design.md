@@ -6,9 +6,9 @@
 
 ## 目标和当前边界
 
-新的训练编码从原始 `RLBench_TRAIN_DATA` 重新构建，直接面向 episode sequence 和 FilterCorrection 微调。历史 `encoded_v1` 不再作为训练输入、基线、回滚路径或兼容目标。
+新的训练编码从 `original/archives` 中的 `RLBench_TRAIN_DATA` task 归档重新构建，直接面向 episode sequence 和 FilterCorrection 微调。历史 `encoded_v1` 已删除，不再作为训练输入、基线、回滚路径或兼容目标。
 
-长期共享的数据源只保留原始 `RLBench_TRAIN_DATA` 和 `RLBench_EVAL_DATA`，以及通过验收流程生成的独立训练/评估派生包。新的编码格式不从 legacy replay 或 `encoded_v1` 转换，也不承担旧布局兼容。
+长期共享的数据源只保留 `original/archives` 下的 `RLBench_TRAIN_DATA` 和 `RLBench_EVAL_DATA` 归档，以及通过验收流程生成的独立训练/评估派生包。新的编码格式不从 legacy replay 或 `encoded_v1` 转换，也不承担旧布局兼容。
 
 训练和评估统一从 `/remote_databuffer` 的 NFS 权威路径只读，不再设计节点本地数据 staging。v2 的 chunk 布局应优先减少小文件和随机 metadata 操作，并把 NFS 的连续 range read、worker cache 和预取作为主要优化对象。基础的长度前缀 chunk reader 已放在 [episode_store.py](/remote_userdata/sunguodong/repos/BridgeVLA/finetune/RLBench/utils/episode_store.py)，后续 encoder 和 sequence adapter 以它为底层，不再复用旧 v1 reader。
 
@@ -26,7 +26,7 @@
 
 ## 历史格式处理
 
-`encoded_v1` 仅作为历史审计产物保留。它的格式、读取性能和字段布局不属于 v2 的设计约束；任何显式选择 `encoded_v1` 的训练入口都必须失败，并提示从原始 RLBench 数据重建新的 `encoded_train_v2`。
+`encoded_v1` 已删除。它的格式、读取性能和字段布局不属于 v2 的设计约束；任何显式选择 `encoded_v1` 的训练入口都必须失败，并提示从归档原始数据重建新的 `encoded_train_v2`。
 
 ## 工程实现方案（v2 原型）
 
@@ -156,4 +156,4 @@ FilterCorrection 不是普通的独立 transition head。它在 episode 起点�
 3. 在 `/remote_databuffer` 上完成 cold/warm 与多 worker 对照；
 4. 在两个代表性任务上跑短 sequence 微调，确认 GPU 等待、hidden-state 轨迹和 loss 行为；
 5. 通过后将 v2 作为唯一正式 encoded 训练格式；
-6. 历史 `encoded_v1` 只保留审计，不重新启用或纳入新汇总。
+6. 历史 `encoded_v1` 与展开小文件树保持删除状态，不重新引入。

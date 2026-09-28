@@ -19,6 +19,7 @@
 #   BRIDGEVLA_RLBENCH_DATA_FOLDER
 #   BRIDGEVLA_RLBENCH_TRAIN_REPLAY_DIR
 #   EVAL_DATAFOLDER             held-out RLBench EVAL data for evaluation launchers
+#   BRIDGEVLA_EVAL_PACK         pre-encoded eval pack root (preferred; no small-file tree)
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo "[bridgevla-runtime] source this file; do not execute it" >&2
@@ -37,6 +38,14 @@ _bridgevla_runtime_config="${BRIDGEVLA_RUNTIME_CONFIG:-${XDG_CONFIG_HOME:-$HOME/
 if [[ -f "$_bridgevla_runtime_config" ]]; then
     # shellcheck disable=SC1090
     source "$_bridgevla_runtime_config"
+fi
+
+# Prefer the pre-encoded eval pack on shared NFS when present.  Evaluation
+# reset only needs Demo metadata; this avoids expanding RLBench camera trees.
+if [[ -z "${BRIDGEVLA_EVAL_PACK:-}" ]]; then
+    if [[ -f /remote_databuffer/BridgeVLA/eval_pack/manifest.json ]]; then
+        export BRIDGEVLA_EVAL_PACK=/remote_databuffer/BridgeVLA/eval_pack
+    fi
 fi
 
 if [[ -n "${BRIDGEVLA_EXPECTED_HOSTNAME:-}" ]]; then

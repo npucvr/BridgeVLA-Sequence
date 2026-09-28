@@ -24,7 +24,7 @@ echo "[runner] host=$(hostname -s 2>/dev/null || hostname) pwd=$(pwd) gpu=${GPU_
 MODEL_FOLDER="${MODEL_FOLDER:-$REPO_ROOT/data/bridgevla_ckpt/bridgevla/rlbench}"
 # The released TRAIN_DATA contains the 100 training demonstrations.  The
 # paper evaluates on the separate held-out EVAL_DATA split (25 episodes).
-EVAL_DATAFOLDER="${EVAL_DATAFOLDER:-/remote_databuffer/BridgeVLA/original/v1/RLBench_EVAL_DATA}"
+EVAL_DATAFOLDER="${EVAL_DATAFOLDER:-/remote_databuffer/BridgeVLA/eval_pack}"
 EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-$REPO_ROOT/outputs}"
 RESULT_LOG_DIR="${RESULT_LOG_DIR:-rlbench_repro}"
 LOG_NAME="${LOG_NAME:-$RESULT_LOG_DIR/run_${RUN_ID}}"
