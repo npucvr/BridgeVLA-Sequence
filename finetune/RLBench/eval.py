@@ -33,6 +33,7 @@ from rlbench.backend import task as rlbench_task
 from rlbench.backend.utils import task_file_to_task_class
 from rlbench.action_modes.gripper_action_modes import Discrete
 from rlbench.action_modes.action_mode import MoveArmThenGripper
+from utils.improved_eval import ImprovedMoveArmThenGripper
 from yarr.utils.rollout_generator import RolloutGenerator
 from yarr.utils.stat_accumulator import SimpleAccumulator
 from yarr.agents.agent import VideoSummary
@@ -180,7 +181,11 @@ def eval(
     arm_action_mode = EndEffectorPoseViaPlanning(
         planning_retries=planning_retries
     )
-    action_mode = MoveArmThenGripper(arm_action_mode, gripper_mode)
+    # Evaluator-side repairs (collision-flag routing + arm settling) default on.
+    if os.environ.get("IMPROVED_EVAL", "1") == "1":
+        action_mode = ImprovedMoveArmThenGripper(arm_action_mode, gripper_mode)
+    else:
+        action_mode = MoveArmThenGripper(arm_action_mode, gripper_mode)
 
     task_files = [
         t.replace(".py", "")
